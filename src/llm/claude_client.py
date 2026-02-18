@@ -7,14 +7,17 @@ Claude along with the original workflow YAML, asking for:
   2. A concrete YAML fix
 """
 
-import os
 import json
+import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
 from anthropic import Anthropic
 
 from src.rules.engine import Finding
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -86,6 +89,7 @@ def enrich_findings(
     enriched = []
 
     for finding in findings:
+        logger.info("Enriching finding: %s (%s)", finding.rule_id, finding.title)
         user_prompt = _build_user_prompt(finding, workflow_yaml)
 
         response = client.messages.create(
@@ -104,6 +108,7 @@ def enrich_findings(
             explanation = data.get("explanation", "No explanation provided.")
             suggested_fix = data.get("suggested_fix", "No fix suggested.")
         except json.JSONDecodeError:
+            logger.warning("Failed to parse Claude response as JSON for finding '%s'", finding.rule_id)
             # If Claude doesn't return valid JSON, use the raw text
             explanation = response_text
             suggested_fix = "Could not parse fix suggestion."
