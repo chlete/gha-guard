@@ -10,6 +10,7 @@ Claude along with the original workflow YAML, asking for:
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -85,30 +86,56 @@ def enrich_findings(
             "variable or pass api_key parameter."
         )
 
+    logger.info("Initializing Claude client (model=%s)", model)
     client = Anthropic(api_key=key)
     enriched = []
 
-    for finding in findings:
-        logger.info("Enriching finding: %s (%s)", finding.rule_id, finding.title)
+    for i, finding in enumerate(findings, 1):
+        logger.info(
+            "Enriching finding %d/%d: [%s] %s",
+            i, len(findings), finding.rule_id, finding.title,
+        )
         user_prompt = _build_user_prompt(finding, workflow_yaml)
+        logger.debug("Prompt length: %d chars", len(user_prompt))
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_prompt},
-            ],
+        t0 = time.monotonic()
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception as e:
+            logger.error(
+                "Claude API request failed for finding '%s': %s",
+                finding.rule_id, e,
+            )
+            raise
+
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        input_tokens = getattr(response.usage, "input_tokens", None)
+        output_tokens = getattr(response.usage, "output_tokens", None)
+        logger.info(
+            "Claude response for '%s': %.0fms, tokens in=%s out=%s",
+            finding.rule_id, elapsed_ms, input_tokens, output_tokens,
         )
 
         # Parse the JSON response
         response_text = response.content[0].text.strip()
+        logger.debug("Raw response (%d chars): %.200s", len(response_text), response_text)
         try:
             data = json.loads(response_text)
             explanation = data.get("explanation", "No explanation provided.")
             suggested_fix = data.get("suggested_fix", "No fix suggested.")
         except json.JSONDecodeError:
-            logger.warning("Failed to parse Claude response as JSON for finding '%s'", finding.rule_id)
+            logger.warning(
+                "Failed to parse Claude response as JSON for finding '%s'. "
+                "Response starts with: %.100s",
+                finding.rule_id, response_text,
+            )
             # If Claude doesn't return valid JSON, use the raw text
             explanation = response_text
             suggested_fix = "Could not parse fix suggestion."
@@ -119,4 +146,5 @@ def enrich_findings(
             suggested_fix=suggested_fix,
         ))
 
+    logger.info("Enrichment complete: %d finding(s) processed", len(enriched))
     return enriched

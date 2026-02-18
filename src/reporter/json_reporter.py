@@ -3,8 +3,11 @@ JSON reporter: outputs findings as structured JSON for programmatic use.
 """
 
 import json
+import logging
 
 from src.rules.engine import Finding
+
+logger = logging.getLogger(__name__)
 
 
 def report_json(findings: list[Finding]) -> str:
@@ -32,4 +35,6 @@ def report_json(findings: list[Finding]) -> str:
             for f in findings
         ],
     }
-    return json.dumps(data, indent=2)
+    output = json.dumps(data, indent=2)
+    logger.info("JSON report: %d finding(s), %d bytes", len(findings), len(output))
+    return output

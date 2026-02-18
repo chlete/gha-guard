@@ -116,6 +116,46 @@ class TestVerbose:
 
 
 # ---------------------------------------------------------------------------
+# Log file
+# ---------------------------------------------------------------------------
+
+class TestLogFile:
+    def test_log_file_created(self, runner, tmp_path):
+        log_path = tmp_path / "scan.log"
+        result = runner.invoke(cli, [
+            "--log-file", str(log_path),
+            "scan", INSECURE_FIXTURE,
+        ])
+        assert result.exit_code == EXIT_FINDINGS
+        assert log_path.exists()
+        log_content = log_path.read_text()
+        assert "Scan started" in log_content
+        assert "Parsing workflow" in log_content
+
+    def test_log_file_contains_rule_timing(self, runner, tmp_path):
+        log_path = tmp_path / "scan.log"
+        runner.invoke(cli, [
+            "--log-file", str(log_path),
+            "scan", INSECURE_FIXTURE,
+        ])
+        log_content = log_path.read_text()
+        assert "check_unpinned_actions" in log_content
+        assert "finding(s) in" in log_content
+
+    def test_log_file_contains_config_info(self, runner, tmp_path):
+        log_path = tmp_path / "scan.log"
+        runner.invoke(cli, [
+            "--log-file", str(log_path),
+            "--verbose",
+            "scan", INSECURE_FIXTURE,
+            "--severity", "critical",
+        ])
+        log_content = log_path.read_text()
+        assert "Effective config" in log_content
+        assert "severity=critical" in log_content
+
+
+# ---------------------------------------------------------------------------
 # Config file integration
 # ---------------------------------------------------------------------------
 
