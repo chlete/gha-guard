@@ -5,12 +5,15 @@ Reads .yml/.yaml files from a workflows directory and normalizes them
 into a structured format that security rules can analyze.
 """
 
+import logging
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -159,6 +162,8 @@ def parse_workflow(file_path: str) -> Workflow:
     if not path.exists():
         raise FileNotFoundError(f"Workflow file not found: {file_path}")
 
+    logger.info("Parsing workflow: %s", file_path)
+
     with open(path, "r") as f:
         raw = yaml.safe_load(f)
 
@@ -167,6 +172,7 @@ def parse_workflow(file_path: str) -> Workflow:
 
     jobs_raw = raw.get("jobs", {})
     jobs = [_parse_job(job_id, job_data) for job_id, job_data in jobs_raw.items()]
+    logger.debug("Found %d job(s) in %s", len(jobs), file_path)
 
     return Workflow(
         file_path=str(path),
@@ -199,4 +205,5 @@ def parse_workflows_dir(dir_path: str) -> list[Workflow]:
         if file.suffix in (".yml", ".yaml"):
             workflows.append(parse_workflow(str(file)))
 
+    logger.info("Parsed %d workflow(s) from %s", len(workflows), dir_path)
     return workflows

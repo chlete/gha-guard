@@ -3,55 +3,98 @@ CLI entry point: ties together parser → rules → LLM → reporter.
 
 Usage:
   # Basic scan (no LLM, just rules):
-  python -m src.cli scan path/to/.github/workflows/
+  python3 -m src scan path/to/.github/workflows/
 
   # AI-enhanced scan (with Claude explanations):
-  python -m src.cli scan path/to/.github/workflows/ --enrich
+  python3 -m src scan path/to/.github/workflows/ --enrich
 
   # Output as JSON:
-  python -m src.cli scan path/to/.github/workflows/ --format json
+  python3 -m src scan path/to/.github/workflows/ --format json
 
   # Scan a single file:
-  python -m src.cli scan path/to/workflow.yml
+  python3 -m src scan path/to/workflow.yml
+
+Exit codes:
+  0 — no findings
+  1 — findings detected
+  2 — error (bad input, missing API key, etc.)
 """
 
+import logging
 import os
 import sys
+
 import click
+import yaml
 
 from src.parser import parse_workflow, parse_workflows_dir
-from src.rules import run_all_rules
+from src.rules import run_all_rules, Severity
 from src.reporter import report_console, report_json
 from src.reporter.enriched_reporter import report_enriched
 
+logger = logging.getLogger(__name__)
+
+EXIT_OK = 0
+EXIT_FINDINGS = 1
+EXIT_ERROR = 2
+
+
+def _setup_logging(verbose: bool) -> None:
+    """Configure logging based on verbosity flag."""
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
 
 @click.group()
-def cli():
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging.")
+def cli(verbose: bool):
     """GitHub Actions Security Scanner — find and fix CI/CD vulnerabilities."""
-    pass
+    _setup_logging(verbose)
 
 
 @cli.command()
 @click.argument("path")
 @click.option("--enrich", is_flag=True, help="Use Claude AI to explain findings and suggest fixes.")
 @click.option("--format", "output_format", type=click.Choice(["console", "json"]), default="console", help="Output format.")
-def scan(path: str, enrich: bool, output_format: str):
-    """Scan GitHub Actions workflow files for security issues."""
+@click.option("--severity", "min_severity", type=click.Choice(["critical", "high", "medium", "low"]), default="low", help="Minimum severity to report.")
+def scan(path: str, enrich: bool, output_format: str, min_severity: str):
+    """Scan GitHub Actions workflow files for security issues.
 
-    # Determine if path is a file or directory
+    Exits with code 0 if no issues found, 1 if issues found, 2 on error.
+    """
+    severity_order = {
+        Severity.LOW: 0,
+        Severity.MEDIUM: 1,
+        Severity.HIGH: 2,
+        Severity.CRITICAL: 3,
+    }
+    min_sev = Severity(min_severity)
+
     path = os.path.abspath(path)
 
-    if os.path.isfile(path):
-        workflows = [parse_workflow(path)]
-    elif os.path.isdir(path):
-        workflows = parse_workflows_dir(path)
-    else:
-        click.echo(f"Error: '{path}' is not a file or directory.", err=True)
-        sys.exit(1)
+    # Parse workflows
+    try:
+        if os.path.isfile(path):
+            workflows = [parse_workflow(path)]
+        elif os.path.isdir(path):
+            workflows = parse_workflows_dir(path)
+        else:
+            click.echo(f"Error: '{path}' is not a file or directory.", err=True)
+            sys.exit(EXIT_ERROR)
+    except (yaml.YAMLError, ValueError) as e:
+        click.echo(f"Error parsing workflow: {e}", err=True)
+        sys.exit(EXIT_ERROR)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(EXIT_ERROR)
 
     if not workflows:
         click.echo("No workflow files found.")
-        return
+        sys.exit(EXIT_OK)
 
     # Run rules on all workflows
     all_findings = []
@@ -59,9 +102,15 @@ def scan(path: str, enrich: bool, output_format: str):
         findings = run_all_rules(wf)
         all_findings.extend(findings)
 
+    # Filter by minimum severity
+    all_findings = [
+        f for f in all_findings
+        if severity_order[f.severity] >= severity_order[min_sev]
+    ]
+
     if not all_findings:
         click.echo("\n✅ No security issues found!")
-        return
+        sys.exit(EXIT_OK)
 
     # If --enrich, use Claude to add explanations
     if enrich:
@@ -72,21 +121,31 @@ def scan(path: str, enrich: bool, output_format: str):
                 "Error: --enrich requires ANTHROPIC_API_KEY environment variable.",
                 err=True,
             )
-            sys.exit(1)
+            sys.exit(EXIT_ERROR)
 
         # Read all workflow YAML content for context
         yaml_contents = {}
         for wf in workflows:
-            with open(wf.file_path, "r") as f:
-                yaml_contents[wf.file_path] = f.read()
+            try:
+                with open(wf.file_path, "r") as f:
+                    yaml_contents[wf.file_path] = f.read()
+            except OSError as e:
+                click.echo(f"Warning: could not read {wf.file_path}: {e}", err=True)
 
         click.echo(f"Enriching {len(all_findings)} finding(s) with Claude AI...\n")
 
-        enriched = []
-        for finding in all_findings:
-            yaml_content = yaml_contents.get(finding.file_path, "")
-            result = enrich_findings([finding], yaml_content)
-            enriched.extend(result)
+        try:
+            enriched = []
+            for finding in all_findings:
+                yaml_content = yaml_contents.get(finding.file_path, "")
+                result = enrich_findings([finding], yaml_content)
+                enriched.extend(result)
+        except Exception as e:
+            logger.error("Claude API error: %s", e)
+            click.echo(f"Error calling Claude API: {e}", err=True)
+            click.echo("Falling back to standard report.\n", err=True)
+            report_console(all_findings, file_path=path)
+            sys.exit(EXIT_FINDINGS)
 
         report_enriched(enriched, file_path=path)
     else:
@@ -96,6 +155,8 @@ def scan(path: str, enrich: bool, output_format: str):
             click.echo(output)
         else:
             report_console(all_findings, file_path=path)
+
+    sys.exit(EXIT_FINDINGS)
 
 
 if __name__ == "__main__":
