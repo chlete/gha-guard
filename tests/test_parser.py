@@ -148,6 +148,25 @@ class TestParseWorkflow:
         step = insecure_workflow.jobs[0].steps[3]
         assert "SECRET_KEY" in step.env
 
+    def test_workflow_has_line_number(self, insecure_workflow):
+        assert insecure_workflow.line_number is not None
+        assert insecure_workflow.line_number >= 1
+
+    def test_job_has_line_number(self, insecure_workflow):
+        build = insecure_workflow.jobs[0]
+        assert build.line_number is not None
+        assert build.line_number >= 1
+
+    def test_step_has_line_number(self, insecure_workflow):
+        step = insecure_workflow.jobs[0].steps[0]
+        assert step.line_number is not None
+        assert step.line_number >= 1
+
+    def test_step_line_numbers_are_ordered(self, insecure_workflow):
+        steps = insecure_workflow.jobs[0].steps
+        lines = [s.line_number for s in steps if s.line_number is not None]
+        assert lines == sorted(lines)
+
     def test_file_not_found(self, tmp_path):
         with pytest.raises(FileNotFoundError):
             parse_workflow(str(tmp_path / "nonexistent.yml"))

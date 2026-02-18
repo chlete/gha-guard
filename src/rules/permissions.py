@@ -28,6 +28,7 @@ def check_permissions(workflow: Workflow) -> list[Finding]:
             file_path=workflow.file_path,
             job_id="",
             step_name="",
+            line_number=workflow.line_number,
         ))
     elif workflow.permissions.get("_all") == "write-all":
         findings.append(Finding(
@@ -42,6 +43,7 @@ def check_permissions(workflow: Workflow) -> list[Finding]:
             file_path=workflow.file_path,
             job_id="",
             step_name="",
+            line_number=workflow.line_number,
         ))
 
     # Check job-level permissions
@@ -58,6 +60,7 @@ def check_permissions(workflow: Workflow) -> list[Finding]:
                 file_path=workflow.file_path,
                 job_id=job.job_id,
                 step_name="",
+                line_number=job.line_number,
             ))
 
     return findings

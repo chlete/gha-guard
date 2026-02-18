@@ -31,6 +31,7 @@ def report_json(findings: list[Finding]) -> str:
                 "file_path": f.file_path,
                 "job_id": f.job_id,
                 "step_name": f.step_name,
+                "line_number": f.line_number,
             }
             for f in findings
         ],
