@@ -2,7 +2,11 @@
 Console reporter: prints findings to the terminal with colors and formatting.
 """
 
+import logging
+
 from src.rules.engine import Finding, Severity
+
+logger = logging.getLogger(__name__)
 
 
 # ANSI color codes for terminal output
@@ -48,6 +52,7 @@ def report_console(findings: list[Finding], file_path: str = "") -> str:
         lines.append(f"  ✅ No security issues found!")
         lines.append("")
         report = "\n".join(lines)
+        logger.info("Console report: no findings")
         print(report)
         return report
 
@@ -81,6 +86,11 @@ def report_console(findings: list[Finding], file_path: str = "") -> str:
     lines.append(f"{BOLD}{'=' * 60}{RESET}")
     lines.append("")
 
+    logger.info(
+        "Console report: %d finding(s) — %s",
+        len(findings),
+        ", ".join(f"{sev.value}={counts[sev]}" for sev in [Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM, Severity.LOW] if sev in counts),
+    )
     report = "\n".join(lines)
     print(report)
     return report

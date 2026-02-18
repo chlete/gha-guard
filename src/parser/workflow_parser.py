@@ -64,14 +64,17 @@ class Workflow:
 def _parse_action_ref(uses_string: str) -> Optional[ActionRef]:
     """Parse an action reference like 'actions/checkout@v3' into components."""
     if not uses_string or "/" not in uses_string:
+        logger.debug("Skipping non-action uses reference: %s", uses_string)
         return None
 
     # Handle docker:// and ./ (local) actions
     if uses_string.startswith("docker://") or uses_string.startswith("./"):
+        logger.debug("Skipping local/docker action: %s", uses_string)
         return None
 
     # Split owner/repo@ref
     if "@" not in uses_string:
+        logger.debug("Skipping action without version ref: %s", uses_string)
         return None
 
     action_path, ref = uses_string.rsplit("@", 1)
@@ -84,6 +87,7 @@ def _parse_action_ref(uses_string: str) -> Optional[ActionRef]:
 
     # A full SHA-1 hash is 40 hex characters
     is_pinned = len(ref) == 40 and all(c in "0123456789abcdef" for c in ref.lower())
+    logger.debug("Parsed action %s/%s@%s (pinned=%s)", owner, repo, ref[:12], is_pinned)
 
     return ActionRef(
         full_ref=uses_string,
@@ -133,6 +137,7 @@ def _parse_permissions(perm_field) -> Optional[dict]:
 def _parse_job(job_id: str, job_raw: dict) -> Job:
     """Parse a raw job dictionary into a Job dataclass."""
     steps_raw = job_raw.get("steps", [])
+    logger.debug("Parsing job '%s' with %d step(s)", job_id, len(steps_raw))
     return Job(
         job_id=job_id,
         name=job_raw.get("name"),
@@ -168,17 +173,24 @@ def parse_workflow(file_path: str) -> Workflow:
         raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict):
+        logger.error("File is not a valid YAML mapping: %s", file_path)
         raise ValueError(f"Workflow file is not a valid YAML mapping: {file_path}")
 
     jobs_raw = raw.get("jobs", {})
     jobs = [_parse_job(job_id, job_data) for job_id, job_data in jobs_raw.items()]
-    logger.debug("Found %d job(s) in %s", len(jobs), file_path)
+    triggers = _parse_triggers(raw.get("on", raw.get(True, [])))
+    permissions = _parse_permissions(raw.get("permissions"))
+    logger.debug(
+        "Parsed '%s': %d job(s), triggers=%s, permissions=%s",
+        raw.get("name", "(unnamed)"), len(jobs), triggers,
+        "none" if permissions is None else list(permissions.keys()),
+    )
 
     return Workflow(
         file_path=str(path),
         name=raw.get("name"),
-        triggers=_parse_triggers(raw.get("on", raw.get(True, []))),
-        permissions=_parse_permissions(raw.get("permissions")),
+        triggers=triggers,
+        permissions=permissions,
         env=raw.get("env", {}),
         jobs=jobs,
         raw=raw,
@@ -200,10 +212,15 @@ def parse_workflows_dir(dir_path: str) -> list[Workflow]:
     if not path.is_dir():
         raise NotADirectoryError(f"Not a directory: {dir_path}")
 
+    yaml_files = sorted(f for f in path.iterdir() if f.suffix in (".yml", ".yaml"))
+    logger.debug("Found %d YAML file(s) in %s", len(yaml_files), dir_path)
+
     workflows = []
-    for file in sorted(path.iterdir()):
-        if file.suffix in (".yml", ".yaml"):
+    for file in yaml_files:
+        try:
             workflows.append(parse_workflow(str(file)))
+        except (ValueError, yaml.YAMLError) as e:
+            logger.warning("Skipping invalid workflow %s: %s", file.name, e)
 
     logger.info("Parsed %d workflow(s) from %s", len(workflows), dir_path)
     return workflows

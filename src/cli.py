@@ -41,21 +41,39 @@ EXIT_FINDINGS = 1
 EXIT_ERROR = 2
 
 
-def _setup_logging(verbose: bool) -> None:
-    """Configure logging based on verbosity flag."""
-    level = logging.DEBUG if verbose else logging.WARNING
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+def _setup_logging(verbose: bool, log_file: str = None) -> None:
+    """Configure logging based on verbosity and optional log file."""
+    root = logging.getLogger()
+    # Remove any previously attached handlers (important when called multiple times)
+    root.handlers.clear()
+    root.setLevel(logging.DEBUG)
+
+    # Console handler — only show warnings unless verbose
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    console.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
-    )
+    ))
+    root.addHandler(console)
+
+    # File handler — always DEBUG level for full traceability
+    if log_file:
+        fh = logging.FileHandler(log_file, mode="w")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        root.addHandler(fh)
 
 
 @click.group()
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging.")
-def cli(verbose: bool):
+@click.option("--log-file", default=None, type=click.Path(), help="Write debug logs to a file.")
+def cli(verbose: bool, log_file: str):
     """GitHub Actions Security Scanner — find and fix CI/CD vulnerabilities."""
-    _setup_logging(verbose)
+    _setup_logging(verbose, log_file)
 
 
 @cli.command()
@@ -77,11 +95,16 @@ def scan(path: str, enrich: bool, output_format: str, min_severity: str, config_
     }
 
     path = os.path.abspath(path)
+    logger.info("Scan started: path=%s", path)
 
     # Load config file (CLI flags override config values)
     config = load_config(config_path=config_path, scan_path=path)
     effective_severity = min_severity or config.severity
     min_sev = Severity(effective_severity)
+    logger.info(
+        "Effective config: severity=%s, ignore_rules=%s, exclude=%s",
+        effective_severity, config.ignore_rules or "(none)", config.exclude or "(none)",
+    )
 
     # Parse workflows
     try:
@@ -136,10 +159,14 @@ def scan(path: str, enrich: bool, output_format: str, min_severity: str, config_
             logger.info("Ignored %d finding(s) via config ignore_rules", ignored)
 
     # Filter by minimum severity
+    before_sev = len(all_findings)
     all_findings = [
         f for f in all_findings
         if severity_order[f.severity] >= severity_order[min_sev]
     ]
+    filtered_sev = before_sev - len(all_findings)
+    if filtered_sev:
+        logger.info("Filtered %d finding(s) below severity '%s'", filtered_sev, effective_severity)
 
     if not all_findings:
         click.echo("\n✅ No security issues found!")

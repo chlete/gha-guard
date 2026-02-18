@@ -2,8 +2,12 @@
 Enriched console reporter: prints findings with LLM-generated explanations and fixes.
 """
 
+import logging
+
 from src.rules.engine import Severity
 from src.llm.claude_client import EnrichedFinding
+
+logger = logging.getLogger(__name__)
 
 
 # ANSI color codes
@@ -44,6 +48,7 @@ def report_enriched(enriched_findings: list[EnrichedFinding], file_path: str = "
         lines.append(f"  ✅ No security issues found!")
         lines.append("")
         report = "\n".join(lines)
+        logger.info("Enriched report: no findings")
         print(report)
         return report
 
@@ -88,6 +93,7 @@ def report_enriched(enriched_findings: list[EnrichedFinding], file_path: str = "
     lines.append(f"{BOLD}{'=' * 60}{RESET}")
     lines.append("")
 
+    logger.info("Enriched report: %d finding(s) with AI explanations", len(enriched_findings))
     report = "\n".join(lines)
     print(report)
     return report
