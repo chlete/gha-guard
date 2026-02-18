@@ -53,7 +53,7 @@ def report_enriched(enriched_findings: list[EnrichedFinding], file_path: str = "
         return report
 
     # Summary
-    counts = {}
+    counts: dict[Severity, int] = {}
     for ef in enriched_findings:
         sev = ef.finding.severity
         counts[sev] = counts.get(sev, 0) + 1

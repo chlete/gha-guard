@@ -57,7 +57,7 @@ def report_console(findings: list[Finding], file_path: str = "") -> str:
         return report
 
     # Summary counts
-    counts = {}
+    counts: dict[Severity, int] = {}
     for f in findings:
         counts[f.severity] = counts.get(f.severity, 0) + 1
 

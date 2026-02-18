@@ -9,7 +9,7 @@ import logging
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional, Union
 
 import yaml
 
@@ -32,9 +32,9 @@ class Step:
     name: Optional[str]
     uses: Optional[ActionRef]
     run: Optional[str]
-    env: dict
-    with_args: dict
-    raw: dict
+    env: dict[str, str]
+    with_args: dict[str, Any]
+    raw: dict[str, Any]
 
 
 @dataclass
@@ -43,10 +43,10 @@ class Job:
     job_id: str
     name: Optional[str]
     runs_on: str
-    permissions: Optional[dict]
+    permissions: Optional[dict[str, str]]
     steps: list[Step]
-    env: dict
-    raw: dict
+    env: dict[str, str]
+    raw: dict[str, Any]
 
 
 @dataclass
@@ -55,10 +55,10 @@ class Workflow:
     file_path: str
     name: Optional[str]
     triggers: list[str]
-    permissions: Optional[dict]
-    env: dict
+    permissions: Optional[dict[str, str]]
+    env: dict[str, str]
     jobs: list[Job]
-    raw: dict
+    raw: dict[str, Any]
 
 
 def _parse_action_ref(uses_string: str) -> Optional[ActionRef]:
@@ -98,7 +98,7 @@ def _parse_action_ref(uses_string: str) -> Optional[ActionRef]:
     )
 
 
-def _parse_step(step_raw: dict) -> Step:
+def _parse_step(step_raw: dict[str, Any]) -> Step:
     """Parse a raw step dictionary into a Step dataclass."""
     uses_str = step_raw.get("uses")
     return Step(
@@ -111,7 +111,7 @@ def _parse_step(step_raw: dict) -> Step:
     )
 
 
-def _parse_triggers(on_field) -> list[str]:
+def _parse_triggers(on_field: Union[str, list[str], dict[str, Any], None]) -> list[str]:
     """Normalize the 'on' field into a list of trigger names."""
     if isinstance(on_field, str):
         return [on_field]
@@ -122,7 +122,7 @@ def _parse_triggers(on_field) -> list[str]:
     return []
 
 
-def _parse_permissions(perm_field) -> Optional[dict]:
+def _parse_permissions(perm_field: Union[str, dict[str, str], None]) -> Optional[dict[str, str]]:
     """Normalize the permissions field into a dict or None."""
     if perm_field is None:
         return None
@@ -134,7 +134,7 @@ def _parse_permissions(perm_field) -> Optional[dict]:
     return None
 
 
-def _parse_job(job_id: str, job_raw: dict) -> Job:
+def _parse_job(job_id: str, job_raw: dict[str, Any]) -> Job:
     """Parse a raw job dictionary into a Job dataclass."""
     steps_raw = job_raw.get("steps", [])
     logger.debug("Parsing job '%s' with %d step(s)", job_id, len(steps_raw))
