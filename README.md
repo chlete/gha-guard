@@ -38,6 +38,9 @@ python3 -m src scan path/to/workflow.yml
 # Output as JSON
 python3 -m src scan path/to/.github/workflows/ --format json
 
+# Output as SARIF (for GitHub Code Scanning)
+python3 -m src scan path/to/.github/workflows/ --format sarif > results.sarif
+
 # Only show critical findings
 python3 -m src scan path/to/.github/workflows/ --severity critical
 
@@ -69,6 +72,23 @@ The `--enrich` flag sends all findings to Claude in a single batched call, which
 | `0` | No findings — clean scan |
 | `1` | Findings detected |
 | `2` | Error (bad input, missing API key, etc.) |
+
+## GitHub Code Scanning (SARIF)
+
+Generate a SARIF file and upload it to GitHub Code Scanning so findings appear as annotations directly on the PR diff:
+
+```yaml
+# .github/workflows/security.yml
+- name: Scan workflows
+  run: python3 -m src scan .github/workflows/ --format sarif > results.sarif
+
+- name: Upload to GitHub Code Scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
+```
+
+Findings will appear in the **Security → Code scanning** tab and as inline annotations on pull requests.
 
 ## Pre-commit integration
 

@@ -32,7 +32,7 @@ import yaml
 from src.config import load_config
 from src.parser import parse_workflow, parse_workflows_dir
 from src.rules import run_all_rules, Severity
-from src.reporter import report_console, report_json
+from src.reporter import report_console, report_json, report_sarif
 from src.reporter.enriched_reporter import report_enriched
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ def cli(verbose: bool, log_file: Optional[str]) -> None:
 @cli.command()
 @click.argument("path")
 @click.option("--enrich", is_flag=True, help="Use Claude AI to explain findings and suggest fixes.")
-@click.option("--format", "output_format", type=click.Choice(["console", "json"]), default="console", help="Output format.")
+@click.option("--format", "output_format", type=click.Choice(["console", "json", "sarif"]), default="console", help="Output format.")
 @click.option("--severity", "min_severity", type=click.Choice(["critical", "high", "medium", "low"]), default=None, help="Minimum severity to report (overrides config file).")
 @click.option("--config", "config_path", default=None, help="Path to .gha-guard.yml config file.")
 def scan(path: str, enrich: bool, output_format: str, min_severity: Optional[str], config_path: Optional[str]) -> None:
@@ -213,6 +213,9 @@ def scan(path: str, enrich: bool, output_format: str, min_severity: Optional[str
         # Standard output
         if output_format == "json":
             output = report_json(all_findings)
+            click.echo(output)
+        elif output_format == "sarif":
+            output = report_sarif(all_findings)
             click.echo(output)
         else:
             report_console(all_findings, file_path=path)
