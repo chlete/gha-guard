@@ -4,6 +4,18 @@
 
 An AI-enhanced CLI tool that scans GitHub Actions workflow files for security vulnerabilities and provides actionable fix suggestions powered by Claude.
 
+## Features
+
+- **6 security rules** — detects unpinned actions, overly broad permissions, script injection, dangerous triggers, secrets in run blocks, and more
+- **AI enrichment** — sends all findings to Claude in a single batched call for beginner-friendly explanations and concrete YAML fix suggestions
+- **Multiple output formats** — console (colored), JSON, and SARIF 2.1.0
+- **GitHub Code Scanning** — upload SARIF output to show findings as inline annotations on PR diffs, with precise line numbers
+- **Pre-commit integration** — blocks commits that introduce new findings, automatically, before code leaves your machine
+- **Config file** — `.gha-guard.yml` for per-repo severity thresholds, ignored rules, and excluded files; auto-discovered from the repo root
+- **Severity filtering** — `--severity critical` to focus on what matters most
+- **Structured logging** — `--log-file scan.log` for full debug traces; `--verbose` for console output
+- **Type-safe** — fully annotated with mypy strict mode, zero type errors
+
 ## What it detects
 
 | Rule | Severity | Description |
