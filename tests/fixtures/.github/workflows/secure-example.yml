@@ -1,0 +1,35 @@
+name: Secure CI Example
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@af513c7a016048ae468971c52ed77d9562c7c819
+
+      - name: Setup Node
+        uses: actions/setup-node@1a4442cacd436585916f1e3d3e6185103c3c3b05
+        with:
+          node-version: "18"
+
+      - name: Greet PR author
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "Hello $PR_TITLE"
+
+      - name: Run tests
+        run: npm test
+        env:
+          NODE_ENV: test
