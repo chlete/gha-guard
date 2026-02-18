@@ -26,6 +26,7 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [Rules vs LLM — Why Both?](#rules-vs-llm--why-both)
    - [Exit Codes](#exit-codes)
    - [Structured Logging](#structured-logging)
+   - [Type Checking with mypy](#type-checking-with-mypy)
    - [Config File Auto-Discovery](#config-file-auto-discovery)
 7. [Testing Philosophy](#testing-philosophy)
 
@@ -482,7 +483,28 @@ def parse_workflow(file_path: str) -> Workflow:
 Type hints tell you (and your editor) what types a function expects and returns. They don't enforce anything at runtime — Python ignores them. But they:
 - Give you autocomplete
 - Help you understand code without reading the implementation
-- Can be checked with tools like `mypy`
+- Can be statically verified with `mypy` (see [Type Checking with mypy](#type-checking-with-mypy))
+
+Some common patterns used in this codebase:
+
+```python
+from typing import Any, Optional, Union
+
+# Optional: the value can be this type OR None
+name: Optional[str]                  # same as Union[str, None]
+
+# Generic containers: always specify the element type
+steps: list[Step]
+env: dict[str, str]
+raw: dict[str, Any]                  # Any = "I don't know the type"
+
+# Union: one of several types
+def _parse_triggers(
+    on_field: Union[str, list[str], dict[str, Any], None]
+) -> list[str]: ...
+```
+
+`Any` is an escape hatch — it tells mypy "don't check this". We use it for `raw` YAML data because YAML can contain anything. Everywhere else we're precise.
 
 ### Mocking in Tests
 
@@ -490,18 +512,33 @@ The LLM tests need to work **without an API key** and **without network calls**.
 
 ```python
 from unittest.mock import patch, MagicMock
+from anthropic.types import TextBlock
 
 @patch("src.llm.claude_client.Anthropic")
 def test_returns_enriched_findings(self, mock_anthropic_cls):
     mock_client = MagicMock()
     mock_anthropic_cls.return_value = mock_client
-    mock_client.messages.create.return_value = fake_response
-
+    mock_client.messages.create.return_value = _mock_claude_response(
+        "This is dangerous because...",
+        "uses: actions/checkout@abc123...",
+    )
     result = enrich_findings(findings, yaml, api_key="fake")
     # Works! Never hits the real API.
 ```
 
-`@patch` replaces the real `Anthropic` class with a fake one for the duration of the test. `MagicMock` is a magic object that accepts any attribute access or method call and returns another mock. This lets us simulate the entire API without any real network calls.
+`@patch` replaces the real `Anthropic` class with a fake one for the duration of the test. `MagicMock` is a magic object that accepts any attribute access or method call and returns another mock.
+
+**Why we use real `TextBlock` instances in mocks:**
+
+The client code filters Claude's response content with:
+
+```python
+text_blocks = [b for b in response.content if isinstance(b, TextBlock)]
+```
+
+If we used a plain `MagicMock()` as the content block, `isinstance(mock, TextBlock)` returns `False` — the filter would produce an empty list and the test would silently get no text back. By constructing a real `TextBlock(type="text", text=...)`, the `isinstance` check passes correctly.
+
+This is a general principle: **when production code uses `isinstance` checks, mocks must be real instances of the expected type**, not generic `MagicMock` objects.
 
 ---
 
@@ -599,6 +636,71 @@ python3 -m src --log-file scan.log scan .github/workflows/
 ```
 
 This is a common pattern in CLI tools. The user sees clean output, but a full trace is available for debugging. The log file includes timestamps, so you can correlate events and measure performance.
+
+### Type Checking with mypy
+
+mypy is a **static analyser** — it reads your code without running it and checks that types are used consistently. We run it with `strict = true`, which enables all checks.
+
+#### What strict mode catches
+
+```python
+# bare dict — mypy asks: dict of what?
+raw: dict          # error: Missing type parameters for generic type "dict"
+raw: dict[str, Any]  # correct
+
+# implicit Optional — PEP 484 says this is ambiguous
+def foo(x: str = None): ...          # error
+def foo(x: Optional[str] = None): ... # correct
+
+# missing return type
+def cli(verbose: bool): ...          # error: missing return type annotation
+def cli(verbose: bool) -> None: ...  # correct
+```
+
+#### The real bug mypy found
+
+The most valuable fix wasn't a style issue — it was a **latent runtime bug** in the LLM client.
+
+Before:
+```python
+response_text = response.content[0].text.strip()  # unsafe!
+```
+
+Claude's API returns `response.content` as a list that can contain 10+ different block types: `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ServerToolUseBlock`, etc. Only `TextBlock` has a `.text` attribute. If Claude ever returned a thinking block or tool use block first, this line would crash with `AttributeError` at runtime.
+
+mypy flagged all 10 union members that lack `.text`. The fix:
+
+```python
+text_blocks = [b for b in response.content if isinstance(b, TextBlock)]
+response_text = text_blocks[0].text.strip() if text_blocks else ""
+```
+
+This is the core value of static analysis: **it finds bugs in code paths you haven't exercised yet**.
+
+#### `__all__` and explicit exports
+
+mypy's `strict` mode also checks that imports come from explicitly exported names. Without `__all__`, mypy treats re-exports in `__init__.py` as implementation details, not public API:
+
+```python
+# src/parser/__init__.py — before
+from .workflow_parser import parse_workflow, parse_workflows_dir
+# mypy error: Module "src.parser" does not explicitly export "parse_workflow"
+
+# after
+from .workflow_parser import parse_workflow, parse_workflows_dir
+__all__ = ["parse_workflow", "parse_workflows_dir"]  # now it's explicit
+```
+
+This is good practice regardless of mypy — `__all__` documents the intended public API of a package.
+
+#### Running mypy
+
+```bash
+python3 -m mypy src/
+# Success: no issues found in 19 source files
+```
+
+It's also in CI (`python-app.yml`) so every PR is checked automatically.
 
 ### Config File Auto-Discovery
 
