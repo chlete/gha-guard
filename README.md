@@ -63,6 +63,33 @@ The `--enrich` flag sends each finding to Claude, which returns:
 | `1` | Findings detected |
 | `2` | Error (bad input, missing API key, etc.) |
 
+## Pre-commit integration
+
+Add gha-guard to your `.pre-commit-config.yaml` to run it automatically before every commit:
+
+```yaml
+repos:
+  - repo: https://github.com/chlete/gha-guard
+    rev: v0.1.0-alpha  # pin to a release tag
+    hooks:
+      - id: gha-guard
+```
+
+Then install the hook:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+From now on, every `git commit` will scan your `.github/workflows/` files. The commit is blocked if any findings are detected (exit code 1).
+
+To run manually against all files:
+
+```bash
+pre-commit run gha-guard --all-files
+```
+
 ## Configuration
 
 Create a `.gha-guard.yml` in your project root to customize behavior:

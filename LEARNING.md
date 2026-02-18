@@ -16,6 +16,7 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [LLM Layer](#4-llm-layer)
    - [CLI](#5-cli)
    - [Config](#6-config)
+   - [Pre-commit Integration](#7-pre-commit-integration)
 5. [Python Concepts Used](#python-concepts-used)
    - [Dataclasses](#dataclasses)
    - [Decorators and the Registry Pattern](#decorators-and-the-registry-pattern)
@@ -27,6 +28,7 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [Exit Codes](#exit-codes)
    - [Structured Logging](#structured-logging)
    - [Type Checking with mypy](#type-checking-with-mypy)
+   - [Pre-commit Hooks](#pre-commit-hooks)
    - [Config File Auto-Discovery](#config-file-auto-discovery)
 7. [Testing Philosophy](#testing-philosophy)
 
@@ -402,6 +404,58 @@ If you have `severity: low` in the config but pass `--severity critical` on the 
 
 ---
 
+### 7. Pre-commit Integration
+
+**File:** `.pre-commit-hooks.yaml`
+
+**What it does:** Lets users plug gha-guard into the [pre-commit](https://pre-commit.com/) framework so it runs automatically before every `git commit`.
+
+**Why this matters:**
+
+Right now, a developer has to remember to run `gha-guard scan` manually. They won't. Security tools only work if they run automatically at the right moment — and the right moment is before code is committed, not after it's already in a PR.
+
+Pre-commit is a widely adopted framework for this. Users add a `.pre-commit-config.yaml` to their repo:
+
+```yaml
+repos:
+  - repo: https://github.com/chlete/gha-guard
+    rev: v0.1.0-alpha
+    hooks:
+      - id: gha-guard
+```
+
+After `pre-commit install`, every `git commit` automatically runs gha-guard against the `.github/workflows/` files. If any findings are detected, the commit is **blocked** (exit code 1). The developer sees the findings and fixes them before the code ever leaves their machine.
+
+**How `.pre-commit-hooks.yaml` works:**
+
+This file is what the pre-commit framework reads from a hook repository. It declares:
+
+```yaml
+- id: gha-guard           # the hook ID users reference
+  name: gha-guard         # display name in terminal output
+  language: python        # pre-commit installs this as a Python package
+  entry: gha-guard scan   # the command to run
+  files: ^.github/workflows/.*\.(yml|yaml)$  # only run on workflow files
+  pass_filenames: false   # scan the whole directory, not individual files
+```
+
+The `files` pattern means the hook only triggers when a `.github/workflows/` file is staged. If you're committing a Python file, gha-guard doesn't run at all — no unnecessary overhead.
+
+`pass_filenames: false` is important: pre-commit normally passes the list of changed files as arguments to the command. We don't want that — we want to scan the whole workflows directory, not just the files being committed (a changed file might interact with an unchanged one).
+
+**The shift-left principle:**
+
+This is an example of "shift left" in security — moving checks earlier in the development process. The earlier you catch a problem, the cheaper it is to fix:
+
+```
+Developer's machine → PR review → CI → Production
+     ↑ cheapest                              ↑ most expensive
+```
+
+A pre-commit hook catches issues at the cheapest possible point.
+
+---
+
 ## Python Concepts Used
 
 ### Dataclasses
@@ -766,6 +820,14 @@ python3 -m mypy src/
 ```
 
 It's also in CI (`python-app.yml`) so every PR is checked automatically.
+
+### Pre-commit Hooks
+
+The `.pre-commit-hooks.yaml` file is a standard contract that the pre-commit framework reads. By adding it to the repo root, gha-guard becomes a first-class pre-commit hook that any project can adopt with two lines of config.
+
+The key design choice is `pass_filenames: false`. Pre-commit normally passes staged filenames as arguments — useful for linters that check individual files. But gha-guard scans a directory holistically (a workflow might reference another workflow), so we always scan the full `.github/workflows/` directory regardless of which files were staged.
+
+The `files` pattern (`^.github/workflows/.*\.(yml|yaml)$`) ensures the hook only activates when a workflow file is part of the commit. No workflow changes = hook skipped entirely.
 
 ### Config File Auto-Discovery
 
