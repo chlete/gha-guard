@@ -25,7 +25,7 @@ This document explains the **why** behind every design decision in gha-guard. It
 6. [Software Engineering Decisions](#software-engineering-decisions)
    - [Rules vs LLM — Why Both?](#rules-vs-llm--why-both)
    - [Exit Codes](#exit-codes)
-   - [Logging vs Print](#logging-vs-print)
+   - [Structured Logging](#structured-logging)
    - [Config File Auto-Discovery](#config-file-auto-discovery)
 7. [Testing Philosophy](#testing-philosophy)
 
@@ -522,17 +522,83 @@ Unix convention: 0 = success, non-zero = failure. We use three codes:
 
 This distinction matters in CI. You might want to allow exit 1 (findings exist but you'll fix them later) while still failing on exit 2 (something is broken).
 
-### Logging vs Print
+### Structured Logging
 
-`print()` always outputs. `logging` lets you control verbosity:
+#### Why logging instead of print?
+
+`print()` always outputs and goes to stdout (mixed with your actual output). `logging` gives you:
+- **Levels** — DEBUG, INFO, WARNING, ERROR — so you can control what's shown
+- **Namespacing** — each module gets its own logger (`logging.getLogger(__name__)`), so you can tell *where* a message came from
+- **Multiple destinations** — console and file simultaneously, with different verbosity levels
+- **Structured format** — timestamps, level names, module names are added automatically
+
+#### How we set it up
+
+Every module creates its own logger at the top:
 
 ```python
-logger.debug("Found %d jobs", len(jobs))   # only shown with -v
-logger.info("Parsing %s", file_path)        # only shown with -v
-logger.warning("Invalid JSON from Claude")  # always shown
+import logging
+logger = logging.getLogger(__name__)
 ```
 
-Users see a clean output by default. Developers debugging an issue can add `-v` to see what's happening internally.
+`__name__` is the module's dotted path (e.g. `src.parser.workflow_parser`). This means log messages automatically include which module produced them.
+
+The CLI configures the root logger in `_setup_logging()`:
+
+```python
+def _setup_logging(verbose, log_file=None):
+    root = logging.getLogger()
+    root.handlers.clear()  # prevent handler accumulation
+    root.setLevel(logging.DEBUG)
+
+    # Console: only warnings unless -v
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.DEBUG if verbose else logging.WARNING)
+    root.addHandler(console)
+
+    # File: always full DEBUG
+    if log_file:
+        fh = logging.FileHandler(log_file, mode="w")
+        fh.setLevel(logging.DEBUG)
+        root.addHandler(fh)
+```
+
+Key decisions:
+- **Console goes to stderr**, not stdout. This keeps log messages separate from the actual scan output (important when piping JSON to another tool).
+- **File handler is always DEBUG**. Even without `-v`, `--log-file scan.log` captures everything. This is invaluable for debugging — you can reproduce an issue and send the log file.
+- **`root.handlers.clear()`** prevents a subtle bug: if `_setup_logging` is called multiple times (e.g. in tests), handlers accumulate and you get duplicate log lines.
+
+#### What we log and why
+
+| Module | Level | What | Why |
+|---|---|---|---|
+| Parser | DEBUG | Skipped actions (docker/local) | Understand why an action wasn't analyzed |
+| Parser | DEBUG | Parsed action details + pin status | Verify the parser is interpreting refs correctly |
+| Parser | INFO | Workflow summary (jobs, triggers, permissions) | Quick overview of what was parsed |
+| Rules | DEBUG | Per-rule execution time | Spot slow rules, optimize if needed |
+| Rules | INFO | Total findings + total time | Performance baseline |
+| LLM | INFO | API response time + token usage | Monitor costs and latency |
+| LLM | DEBUG | Prompt length, raw response preview | Debug when Claude returns unexpected output |
+| LLM | WARNING | JSON parse failures with response snippet | Know exactly what went wrong without re-running |
+| CLI | INFO | Effective config, filter counts | Understand why findings were included/excluded |
+
+#### Log levels — when to use which
+
+- **DEBUG** — detailed internal state. Only developers care. "Parsed action actions/checkout@v3 (pinned=False)"
+- **INFO** — high-level progress. "Running 5 rule(s) against workflow.yml", "Completed: 7 finding(s) in 1.5ms"
+- **WARNING** — something unexpected but recoverable. "Failed to parse Claude response as JSON"
+- **ERROR** — something failed. "Claude API request failed"
+
+The rule of thumb: if you'd want to see it when debugging a user's issue, it should be logged.
+
+#### The `--log-file` option
+
+```bash
+# Clean console output + full debug log to file
+python3 -m src --log-file scan.log scan .github/workflows/
+```
+
+This is a common pattern in CLI tools. The user sees clean output, but a full trace is available for debugging. The log file includes timestamps, so you can correlate events and measure performance.
 
 ### Config File Auto-Discovery
 
