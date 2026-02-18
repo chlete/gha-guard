@@ -148,3 +148,13 @@ class TestSarifResults:
         parsed = json.loads(report_sarif([_make_finding(job_id="", step_name="")]))
         logical = parsed["runs"][0]["results"][0]["locations"][0]["logicalLocations"]
         assert logical == []
+
+    def test_result_uses_line_number_when_present(self):
+        parsed = json.loads(report_sarif([_make_finding(line_number=42)]))
+        region = parsed["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]
+        assert region["startLine"] == 42
+
+    def test_result_falls_back_to_line_1_when_no_line_number(self):
+        parsed = json.loads(report_sarif([_make_finding(line_number=None)]))
+        region = parsed["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]
+        assert region["startLine"] == 1

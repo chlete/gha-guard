@@ -75,9 +75,8 @@ def _build_result(f: Finding) -> dict[str, Any]:
                         "uri": f.file_path,
                         "uriBaseId": "%SRCROOT%",
                     },
-                    # SARIF requires a region; we don't have line numbers so
-                    # we point to the start of the file
-                    "region": {"startLine": 1},
+                    # Use the actual line number when available; fall back to 1
+                    "region": {"startLine": f.line_number if f.line_number else 1},
                 },
                 "logicalLocations": _build_logical_locations(f),
             }

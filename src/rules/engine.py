@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from typing import Callable, Optional
 
 from src.parser.workflow_parser import Workflow
 
@@ -30,6 +30,7 @@ class Finding:
     file_path: str        # which workflow file
     job_id: str           # which job (empty string if workflow-level)
     step_name: str        # which step (empty string if job/workflow-level)
+    line_number: Optional[int] = None  # source line in the workflow file
 
 
 # Type alias: a rule is a function that takes a Workflow and returns findings

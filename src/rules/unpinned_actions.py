@@ -28,5 +28,6 @@ def check_unpinned_actions(workflow: Workflow) -> list[Finding]:
                     file_path=workflow.file_path,
                     job_id=job.job_id,
                     step_name=step.name or step.uses.full_ref,
+                    line_number=step.line_number,
                 ))
     return findings

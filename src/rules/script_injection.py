@@ -63,5 +63,6 @@ def check_script_injection(workflow: Workflow) -> list[Finding]:
                             file_path=workflow.file_path,
                             job_id=job.job_id,
                             step_name=step.name or "(unnamed step)",
+                            line_number=step.line_number,
                         ))
     return findings

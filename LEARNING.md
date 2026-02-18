@@ -30,6 +30,7 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [Type Checking with mypy](#type-checking-with-mypy)
    - [Pre-commit Hooks](#pre-commit-hooks)
    - [SARIF Output and GitHub Code Scanning](#sarif-output-and-github-code-scanning)
+   - [Line Number Tracking in the Parser](#line-number-tracking-in-the-parser)
    - [Config File Auto-Discovery](#config-file-auto-discovery)
 7. [Testing Philosophy](#testing-philosophy)
 
@@ -170,17 +171,19 @@ if "uses" in step and "@" in step["uses"]:
 **The hierarchy:**
 
 ```
-Workflow          ← one per .yml file
+Workflow          ← one per .yml file, line_number = 1
 ├── triggers      ← ["push", "pull_request_target"]
 ├── permissions   ← {"_all": "write-all"} or {"contents": "read"}
 └── jobs[]
-    └── Job
+    └── Job       ← line_number = line of "build:" in YAML
         ├── permissions
         └── steps[]
-            └── Step
+            └── Step  ← line_number = line of "- name:" in YAML
                 ├── uses → ActionRef (or None)
                 └── run  → string (or None)
 ```
+
+Every `Workflow`, `Job`, and `Step` carries a `line_number` — the exact source line where that node starts in the YAML file. This flows into `Finding.line_number`, which the SARIF reporter uses to produce precise inline annotations on the PR diff.
 
 The parser is a **translator** between raw YAML (messy, untyped) and this clean structure. It runs once, and from that point on, nothing else touches raw YAML.
 
@@ -885,6 +888,57 @@ The `.pre-commit-hooks.yaml` file is a standard contract that the pre-commit fra
 The key design choice is `pass_filenames: false`. Pre-commit normally passes staged filenames as arguments — useful for linters that check individual files. But gha-guard scans a directory holistically (a workflow might reference another workflow), so we always scan the full `.github/workflows/` directory regardless of which files were staged.
 
 The `files` pattern (`^.github/workflows/.*\.(yml|yaml)$`) ensures the hook only activates when a workflow file is part of the commit. No workflow changes = hook skipped entirely.
+
+### Line Number Tracking in the Parser
+
+Python's `pyyaml` doesn't expose line numbers by default — `yaml.safe_load()` returns plain Python dicts with no source location information. To get line numbers we use a custom `Loader` subclass that hooks into PyYAML's node construction:
+
+```python
+class _LineLoader(yaml.SafeLoader):
+    """PyYAML loader that stores the start line on every mapping node."""
+
+def _construct_mapping(loader, node):
+    mapping = loader.construct_mapping(node, deep=True)
+    mapping["__line__"] = node.start_mark.line + 1  # 0-indexed → 1-indexed
+    return mapping
+
+_LineLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping,
+)
+```
+
+Every time PyYAML constructs a YAML mapping (i.e. a `{}` dict), our hook runs and injects `__line__` into it. The `node.start_mark.line` is the 0-indexed line where that mapping starts in the file — we add 1 to make it 1-indexed (matching what editors show).
+
+**The `__line__` key must be filtered out** when iterating over YAML structure. For example, the `jobs:` mapping now has a `__line__` key alongside the actual job IDs:
+
+```python
+# jobs_raw looks like: {"build": {...}, "deploy": {...}, "__line__": 10}
+jobs = [
+    _parse_job(job_id, job_data)
+    for job_id, job_data in jobs_raw.items()
+    if job_id != "__line__"   # ← must filter
+]
+```
+
+Similarly, the `steps:` list can contain the `__line__` integer from the parent mapping, so we filter to only `dict` items:
+
+```python
+steps_raw = [s for s in job_raw.get("steps", []) if isinstance(s, dict)]
+```
+
+**How it flows through the stack:**
+
+```
+YAML node.start_mark.line
+    → __line__ key in raw dict
+    → Step.line_number / Job.line_number / Workflow.line_number
+    → Finding.line_number
+    → SARIF region.startLine  (precise PR annotation)
+    → JSON output line_number field
+```
+
+The `line_number` field is `Optional[int]` everywhere — if a node somehow doesn't have it (e.g. inline YAML or edge cases), everything still works, falling back to `startLine: 1` in SARIF.
 
 ### Config File Auto-Discovery
 
