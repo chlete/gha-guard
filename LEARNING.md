@@ -1,0 +1,599 @@
+# gha-guard — Learning Guide
+
+This document explains the **why** behind every design decision in gha-guard. It's written so you can come back later and understand not just what the code does, but why it was built this way.
+
+---
+
+## Table of Contents
+
+1. [The Problem We're Solving](#the-problem-were-solving)
+2. [Architecture Overview](#architecture-overview)
+3. [Why This Layered Design?](#why-this-layered-design)
+4. [Step-by-Step Walkthrough](#step-by-step-walkthrough)
+   - [Parser](#1-parser)
+   - [Rules](#2-rules)
+   - [Reporter](#3-reporter)
+   - [LLM Layer](#4-llm-layer)
+   - [CLI](#5-cli)
+   - [Config](#6-config)
+5. [Python Concepts Used](#python-concepts-used)
+   - [Dataclasses](#dataclasses)
+   - [Decorators and the Registry Pattern](#decorators-and-the-registry-pattern)
+   - [Enums](#enums)
+   - [Type Hints](#type-hints)
+   - [Mocking in Tests](#mocking-in-tests)
+6. [Software Engineering Decisions](#software-engineering-decisions)
+   - [Rules vs LLM — Why Both?](#rules-vs-llm--why-both)
+   - [Exit Codes](#exit-codes)
+   - [Logging vs Print](#logging-vs-print)
+   - [Config File Auto-Discovery](#config-file-auto-discovery)
+7. [Testing Philosophy](#testing-philosophy)
+
+---
+
+## The Problem We're Solving
+
+GitHub Actions workflows are YAML files that define CI/CD pipelines. They're powerful but have a large attack surface. Common mistakes include:
+
+- **Unpinned actions** — `uses: actions/checkout@v3` references a mutable tag. If someone compromises the action repo and moves the `v3` tag, your pipeline silently runs malicious code. Pinning to a full SHA (`@af513c7a...`) prevents this.
+
+- **Overly broad permissions** — `permissions: write-all` gives the workflow token full access to your repo. If any step is compromised, the attacker can push code, create releases, etc.
+
+- **Script injection** — Writing `${{ github.event.pull_request.title }}` directly in a `run:` block means an attacker can craft a PR title like `"; rm -rf /; echo "` and it gets executed as shell code.
+
+- **Dangerous triggers** — `pull_request_target` runs with write access and secrets, even for PRs from forks. Combined with checking out PR code, this is a well-known attack vector.
+
+- **Secrets in shell commands** — `curl -H "Authorization: ${{ secrets.TOKEN }}"` can leak the secret in logs or process lists.
+
+These are real-world vulnerabilities that have been exploited in major open-source projects.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                         CLI (cli.py)                        │
+│  Ties everything together. Handles args, errors, exit codes │
+└──────────┬──────────────────────────────────────────────────┘
+           │
+           │ uses
+           ▼
+┌──────────────────┐    ┌──────────────────┐    ┌─────────────┐
+│     Parser       │───▶│     Rules        │───▶│  Reporter   │
+│  YAML → Python   │    │  Find problems   │    │  Format     │
+│  objects         │    │  deterministic   │    │  output     │
+└──────────────────┘    └────────┬─────────┘    └──────┬──────┘
+                                 │                     │
+                                 ▼                     ▼
+                        ┌──────────────────┐    ┌─────────────┐
+                        │   LLM (Claude)   │───▶│  Enriched   │
+                        │   Explain & fix  │    │  Reporter   │
+                        └──────────────────┘    └─────────────┘
+```
+
+Data flows left to right:
+1. **Parser** reads YAML, produces clean Python objects
+2. **Rules** inspect those objects, produce findings
+3. **Reporter** formats findings for humans or machines
+4. **LLM** (optional) enriches findings with explanations
+
+Each layer only knows about the one before it. The reporter doesn't know about YAML. The rules don't know about output formatting. This is called **separation of concerns**.
+
+---
+
+## Why This Layered Design?
+
+Imagine you wrote everything in one big function:
+
+```python
+def scan(path):
+    yaml = open(path).read()
+    data = parse(yaml)
+    for job in data["jobs"]:
+        for step in job["steps"]:
+            if "uses" in step and "@" in step["uses"]:
+                # check if pinned...
+                # format output...
+                # call Claude...
+                print(f"Found issue: {step['uses']}")
+```
+
+This works for a prototype, but it becomes a nightmare to maintain:
+- Want to add JSON output? You have to change the scanning logic.
+- Want to add a new rule? You have to modify the same giant function.
+- Want to test the parser without running rules? You can't.
+- Want to skip the LLM call? You have to add if-statements everywhere.
+
+By splitting into layers, each piece is:
+- **Independently testable** — test the parser without rules, test rules without the reporter
+- **Easy to extend** — add a new rule by creating one file, add a new output format by creating one file
+- **Easy to understand** — each file has one job
+
+---
+
+## Step-by-Step Walkthrough
+
+### 1. Parser
+
+**Files:** `src/parser/workflow_parser.py`
+
+**What it does:** Reads a `.yml` file and converts it into Python dataclasses.
+
+**Why dataclasses?**
+
+A GitHub Actions workflow is a nested structure: a workflow has jobs, jobs have steps, steps have actions. We need to represent this in Python.
+
+We could use plain dictionaries:
+
+```python
+step = raw_yaml["jobs"]["build"]["steps"][0]
+action = step["uses"]  # "actions/checkout@v3"
+# Now manually parse "actions/checkout@v3" every time we need the parts...
+```
+
+Problems: no autocomplete, easy to typo keys, no structure, have to re-parse strings everywhere.
+
+Instead, we define **dataclasses** — lightweight Python classes that hold structured data:
+
+```python
+@dataclass
+class ActionRef:
+    full_ref: str       # "actions/checkout@v3"
+    owner: str          # "actions"
+    repo: str           # "checkout"
+    ref: str            # "v3"
+    is_pinned: bool     # False
+```
+
+The `@dataclass` decorator auto-generates `__init__`, `__repr__`, and `__eq__` for you. You write each field once. Your editor gives you autocomplete. The rest of the code becomes clean:
+
+```python
+if step.uses and not step.uses.is_pinned:
+    report("Unpinned action!")
+```
+
+Instead of:
+
+```python
+if "uses" in step and "@" in step["uses"]:
+    parts = step["uses"].split("@")
+    ref = parts[1]
+    if len(ref) != 40 or not all(c in "0123456789abcdef" for c in ref):
+        report("Unpinned action!")
+```
+
+**The hierarchy:**
+
+```
+Workflow          ← one per .yml file
+├── triggers      ← ["push", "pull_request_target"]
+├── permissions   ← {"_all": "write-all"} or {"contents": "read"}
+└── jobs[]
+    └── Job
+        ├── permissions
+        └── steps[]
+            └── Step
+                ├── uses → ActionRef (or None)
+                └── run  → string (or None)
+```
+
+The parser is a **translator** between raw YAML (messy, untyped) and this clean structure. It runs once, and from that point on, nothing else touches raw YAML.
+
+---
+
+### 2. Rules
+
+**Files:** `src/rules/engine.py`, `src/rules/unpinned_actions.py`, etc.
+
+**What it does:** Each rule is a function that takes a `Workflow` and returns a list of `Finding` objects.
+
+**The registry pattern:**
+
+```python
+_rules = []
+
+def register_rule(func):
+    _rules.append(func)
+    return func
+
+@register_rule
+def check_unpinned_actions(workflow):
+    ...
+```
+
+When Python imports the file, the `@register_rule` decorator runs and adds the function to the `_rules` list. Then `run_all_rules()` just loops through that list.
+
+**Why this pattern?** Adding a new rule is just:
+1. Create a new file in `src/rules/`
+2. Write a function with `@register_rule`
+3. Import it in `src/rules/__init__.py`
+
+You never edit the engine. You never edit other rules. Each rule is completely independent.
+
+**The Finding dataclass:**
+
+```python
+@dataclass
+class Finding:
+    rule_id: str       # "unpinned-action"
+    severity: Severity # Severity.HIGH
+    title: str         # "Unpinned action reference"
+    description: str   # detailed explanation
+    file_path: str     # which file
+    job_id: str        # which job
+    step_name: str     # which step
+```
+
+This is the "contract" between rules and reporters. Rules produce findings, reporters consume them. Neither needs to know about the other.
+
+---
+
+### 3. Reporter
+
+**Files:** `src/reporter/console_reporter.py`, `json_reporter.py`, `enriched_reporter.py`
+
+**What it does:** Takes a list of `Finding` objects and formats them for output.
+
+Three formats:
+- **Console** — colored terminal output with ANSI escape codes
+- **JSON** — structured data for piping to other tools
+- **Enriched** — console output with LLM explanations added
+
+**Why three?** Different use cases:
+- A human running the tool locally wants colored console output
+- A CI pipeline wants JSON to parse programmatically
+- A developer learning about security wants the enriched explanations
+
+Each reporter is a pure function: `list[Finding] → string`. No side effects, easy to test.
+
+---
+
+### 4. LLM Layer
+
+**Files:** `src/llm/claude_client.py`
+
+**What it does:** Takes findings + the original YAML, sends them to Claude, and gets back explanations and fix suggestions.
+
+**Why not just use Claude for everything?**
+
+This is a key design decision. We use **rules for detection** and **Claude for explanation**:
+
+| Task | Best tool | Why |
+|---|---|---|
+| "Is this a 40-char SHA?" | Code | Fast, exact, free, deterministic |
+| "Explain why this matters" | LLM | Creative, contextual, nuanced |
+
+Rules are:
+- **Deterministic** — same input, same output, every time
+- **Free** — no API calls
+- **Fast** — milliseconds
+- **Reliable** — zero false positives for well-defined checks
+
+LLMs are:
+- **Non-deterministic** — might miss things or hallucinate
+- **Expensive** — costs money per call
+- **Slow** — seconds per call
+- **Great at reasoning** — can explain context, suggest fixes
+
+By combining both, you get reliable detection with intelligent explanation.
+
+**The prompt design:**
+
+```python
+SYSTEM_PROMPT = """You are a GitHub Actions security expert...
+respond with EXACTLY this JSON format..."""
+```
+
+We ask for **JSON only** — no markdown, no extra text. This makes parsing reliable. If Claude returns invalid JSON (rare), we fall back to using the raw text.
+
+Each finding gets its own API call. This keeps prompts focused and responses precise. Claude sees the specific finding + the full YAML for context.
+
+---
+
+### 5. CLI
+
+**Files:** `src/cli.py`, `src/__main__.py`
+
+**What it does:** The entry point that ties everything together.
+
+**Why `click`?**
+
+`click` is a Python library for building CLIs. It handles:
+- Argument parsing (`scan path/to/workflows/`)
+- Options (`--enrich`, `--format json`, `--severity critical`)
+- Help text (auto-generated from docstrings)
+- Error messages
+
+You define commands with decorators:
+
+```python
+@cli.command()
+@click.argument("path")
+@click.option("--enrich", is_flag=True)
+def scan(path, enrich):
+    ...
+```
+
+**Why `__main__.py`?**
+
+This file lets you run the package as a module:
+
+```bash
+python3 -m src scan ...
+```
+
+Python looks for `__main__.py` when you use `-m`. It just imports and calls `cli()`.
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| 0 | Clean — no findings |
+| 1 | Findings detected |
+| 2 | Error |
+
+This is a Unix convention. CI tools check exit codes to decide if a step passed or failed. Exit 0 = success, anything else = failure. By exiting 1 when findings exist, you can use gha-guard as a pipeline gate:
+
+```yaml
+- name: Security scan
+  run: python3 -m src scan .github/workflows/
+  # Pipeline fails if any findings are detected (exit 1)
+```
+
+**Error handling:**
+
+Instead of letting Python crash with a traceback:
+
+```
+Traceback (most recent call last):
+  File "...", line 42, in ...
+yaml.scanner.ScannerError: mapping values are not allowed here
+```
+
+We catch exceptions and show friendly messages:
+
+```
+Error parsing workflow: mapping values are not allowed here
+```
+
+This is important for a tool that non-Python-developers will use.
+
+---
+
+### 6. Config
+
+**Files:** `src/config.py`
+
+**What it does:** Loads a `.gha-guard.yml` file that lets users customize behavior without changing code.
+
+**Why a config file?**
+
+Without it, every customization requires CLI flags:
+
+```bash
+python3 -m src scan workflows/ --severity high  # have to remember every time
+```
+
+With a config file, you set it once:
+
+```yaml
+# .gha-guard.yml
+severity: high
+ignore_rules:
+  - manual-trigger
+```
+
+And it applies automatically. The config file lives in the repo, so the whole team shares the same settings.
+
+**Auto-discovery:**
+
+The tool searches for `.gha-guard.yml` in:
+1. Explicit `--config` path (if provided)
+2. The scan directory, then its parents (walks up the tree)
+3. Current working directory
+
+This means you can put the config at the repo root and scan from any subdirectory — it'll still find it.
+
+**CLI overrides config:**
+
+If you have `severity: low` in the config but pass `--severity critical` on the command line, the CLI wins. This follows the principle of **least surprise** — explicit is better than implicit.
+
+---
+
+## Python Concepts Used
+
+### Dataclasses
+
+A `@dataclass` is a decorator that auto-generates boilerplate for classes that mainly hold data:
+
+```python
+from dataclasses import dataclass
+
+@dataclass
+class Point:
+    x: float
+    y: float
+```
+
+This is equivalent to writing:
+
+```python
+class Point:
+    def __init__(self, x: float, y: float):
+        self.x = x
+        self.y = y
+
+    def __repr__(self):
+        return f"Point(x={self.x}, y={self.y})"
+
+    def __eq__(self, other):
+        return self.x == other.x and self.y == other.y
+```
+
+You write each field **once** instead of three times. We use dataclasses for `ActionRef`, `Step`, `Job`, `Workflow`, `Finding`, `EnrichedFinding`, and `Config`.
+
+### Decorators and the Registry Pattern
+
+A decorator is a function that wraps another function:
+
+```python
+def register_rule(func):
+    _rules.append(func)  # side effect: add to list
+    return func           # return the original function unchanged
+
+@register_rule
+def check_unpinned_actions(workflow):
+    ...
+```
+
+The `@register_rule` syntax is just shorthand for:
+
+```python
+def check_unpinned_actions(workflow):
+    ...
+check_unpinned_actions = register_rule(check_unpinned_actions)
+```
+
+When Python imports the file, it calls `register_rule`, which adds the function to `_rules`. Later, `run_all_rules()` loops through `_rules` and calls each one.
+
+This is the **registry pattern** — a way to collect things (functions, classes, handlers) without a central list that you have to manually maintain.
+
+### Enums
+
+```python
+from enum import Enum
+
+class Severity(Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+```
+
+An enum is a fixed set of named values. Instead of passing strings around (easy to typo: `"hgih"`), you use `Severity.HIGH`. Your editor catches mistakes at write-time, not runtime.
+
+### Type Hints
+
+```python
+def parse_workflow(file_path: str) -> Workflow:
+```
+
+Type hints tell you (and your editor) what types a function expects and returns. They don't enforce anything at runtime — Python ignores them. But they:
+- Give you autocomplete
+- Help you understand code without reading the implementation
+- Can be checked with tools like `mypy`
+
+### Mocking in Tests
+
+The LLM tests need to work **without an API key** and **without network calls**. We use `unittest.mock` to fake Claude's responses:
+
+```python
+from unittest.mock import patch, MagicMock
+
+@patch("src.llm.claude_client.Anthropic")
+def test_returns_enriched_findings(self, mock_anthropic_cls):
+    mock_client = MagicMock()
+    mock_anthropic_cls.return_value = mock_client
+    mock_client.messages.create.return_value = fake_response
+
+    result = enrich_findings(findings, yaml, api_key="fake")
+    # Works! Never hits the real API.
+```
+
+`@patch` replaces the real `Anthropic` class with a fake one for the duration of the test. `MagicMock` is a magic object that accepts any attribute access or method call and returns another mock. This lets us simulate the entire API without any real network calls.
+
+---
+
+## Software Engineering Decisions
+
+### Rules vs LLM — Why Both?
+
+See the [LLM Layer section](#4-llm-layer) for the full explanation. The short version:
+
+> Use code for what code is good at (precise, deterministic checks). Use AI for what AI is good at (reasoning, explaining, suggesting).
+
+### Exit Codes
+
+Unix convention: 0 = success, non-zero = failure. We use three codes:
+- **0** — clean scan (no findings)
+- **1** — findings detected (the tool worked, but there are issues)
+- **2** — error (the tool itself failed)
+
+This distinction matters in CI. You might want to allow exit 1 (findings exist but you'll fix them later) while still failing on exit 2 (something is broken).
+
+### Logging vs Print
+
+`print()` always outputs. `logging` lets you control verbosity:
+
+```python
+logger.debug("Found %d jobs", len(jobs))   # only shown with -v
+logger.info("Parsing %s", file_path)        # only shown with -v
+logger.warning("Invalid JSON from Claude")  # always shown
+```
+
+Users see a clean output by default. Developers debugging an issue can add `-v` to see what's happening internally.
+
+### Config File Auto-Discovery
+
+Walking up the directory tree to find the config is a pattern used by many tools (`.gitignore`, `.eslintrc`, `pyproject.toml`). It means you can:
+- Put the config at the repo root
+- Run the tool from any subdirectory
+- It still finds the config
+
+---
+
+## Testing Philosophy
+
+### Test structure
+
+Each source module has a corresponding test file:
+
+| Source | Tests |
+|---|---|
+| `src/parser/` | `tests/test_parser.py` |
+| `src/rules/` | `tests/test_rules.py` |
+| `src/reporter/` | `tests/test_reporter.py` |
+| `src/llm/` | `tests/test_llm.py` |
+| `src/cli.py` | `tests/test_cli.py` |
+| `src/config.py` | `tests/test_config.py` |
+
+### Types of tests
+
+1. **Unit tests** — test one function in isolation. Example: `_parse_action_ref("actions/checkout@v3")` returns the right `ActionRef`.
+
+2. **Integration tests** — test multiple components together. Example: parse a fixture file, run all rules, check that the expected findings are produced.
+
+3. **Edge case tests** — test boundary conditions. Example: what happens with an empty string? A 39-character almost-SHA? An empty directory?
+
+4. **Error tests** — test that errors are handled correctly. Example: `parse_workflow("nonexistent.yml")` raises `FileNotFoundError`.
+
+### Fixtures
+
+We have two workflow fixtures:
+- `insecure-example.yml` — deliberately insecure, triggers all rules
+- `secure-example.yml` — properly hardened, triggers zero rules
+
+The insecure fixture is our "positive test" (should find issues). The secure fixture is our "negative test" (should find nothing). Both are equally important — you need to verify the tool doesn't produce false positives.
+
+### Shared fixtures with conftest.py
+
+`conftest.py` defines pytest fixtures that are shared across all test files:
+
+```python
+@pytest.fixture
+def insecure_workflow():
+    return parse_workflow("fixtures/.../insecure-example.yml")
+```
+
+Any test can use `insecure_workflow` as a parameter and pytest automatically provides it. This avoids duplicating setup code across test files.
+
+### Mocking external dependencies
+
+The LLM tests mock the Anthropic API so they:
+- Run without an API key
+- Run without network access
+- Run in milliseconds (no real API calls)
+- Are deterministic (same fake response every time)
+
+This is critical for CI — your tests should never depend on external services.
