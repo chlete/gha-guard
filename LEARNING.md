@@ -29,6 +29,7 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [Structured Logging](#structured-logging)
    - [Type Checking with mypy](#type-checking-with-mypy)
    - [Pre-commit Hooks](#pre-commit-hooks)
+   - [SARIF Output and GitHub Code Scanning](#sarif-output-and-github-code-scanning)
    - [Config File Auto-Discovery](#config-file-auto-discovery)
 7. [Testing Philosophy](#testing-philosophy)
 
@@ -234,18 +235,20 @@ This is the "contract" between rules and reporters. Rules produce findings, repo
 
 ### 3. Reporter
 
-**Files:** `src/reporter/console_reporter.py`, `json_reporter.py`, `enriched_reporter.py`
+**Files:** `src/reporter/console_reporter.py`, `json_reporter.py`, `enriched_reporter.py`, `sarif_reporter.py`
 
 **What it does:** Takes a list of `Finding` objects and formats them for output.
 
-Three formats:
+Four formats:
 - **Console** — colored terminal output with ANSI escape codes
 - **JSON** — structured data for piping to other tools
 - **Enriched** — console output with LLM explanations added
+- **SARIF** — standard format for GitHub Code Scanning integration
 
-**Why three?** Different use cases:
+**Why four?** Different use cases:
 - A human running the tool locally wants colored console output
 - A CI pipeline wants JSON to parse programmatically
+- A GitHub Actions workflow wants SARIF to show findings as PR annotations
 - A developer learning about security wants the enriched explanations
 
 Each reporter is a pure function: `list[Finding] → string`. No side effects, easy to test.
@@ -820,6 +823,60 @@ python3 -m mypy src/
 ```
 
 It's also in CI (`python-app.yml`) so every PR is checked automatically.
+
+### SARIF Output and GitHub Code Scanning
+
+SARIF (Static Analysis Results Interchange Format) is a JSON standard that GitHub's Code Scanning feature understands. When you upload a SARIF file, findings appear as **inline annotations on the PR diff** in the Security tab — the reviewer sees the issue right next to the code that caused it.
+
+**The SARIF structure:**
+
+```json
+{
+  "version": "2.1.0",
+  "runs": [{
+    "tool": {
+      "driver": {
+        "name": "gha-guard",
+        "rules": [
+          {
+            "id": "unpinned-action",
+            "shortDescription": {"text": "Unpinned action reference"},
+            "properties": {"security-severity": "7.0"}
+          }
+        ]
+      }
+    },
+    "results": [
+      {
+        "ruleId": "unpinned-action",
+        "level": "error",
+        "message": {"text": "Action is not pinned to a SHA."},
+        "locations": [{"physicalLocation": {"artifactLocation": {"uri": ".github/workflows/ci.yml"}}}]
+      }
+    ]
+  }]
+}
+```
+
+Key design decisions:
+
+- **`security-severity`** is a numeric score (0.0–10.0) that GitHub uses to classify findings. We map our severities: CRITICAL=9.0, HIGH=7.0, MEDIUM=5.0, LOW=3.0.
+- **`level`** controls the annotation colour: `error` (red), `warning` (yellow), `note` (blue). CRITICAL and HIGH both map to `error` — both should block a PR.
+- **Rules are deduplicated** — if 3 findings share the same `rule_id`, the `rules` array still has one entry. Results reference rules by ID.
+- **`logicalLocations`** carry the job and step names, giving GitHub extra context beyond just the file path.
+- **`pass_filenames: false`** — we don't have line numbers (the YAML parser doesn't track them), so we point all findings to `startLine: 1`. This is valid SARIF — GitHub still shows the annotation on the file.
+
+**How to use it in CI:**
+
+```yaml
+- name: Scan workflows
+  run: python3 -m src scan .github/workflows/ --format sarif > results.sarif
+
+- name: Upload to GitHub Code Scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
+```
 
 ### Pre-commit Hooks
 
