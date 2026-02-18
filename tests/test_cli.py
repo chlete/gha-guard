@@ -113,3 +113,80 @@ class TestVerbose:
     def test_verbose_flag_accepted(self, runner):
         result = runner.invoke(cli, ["-v", "scan", SECURE_FIXTURE])
         assert result.exit_code == EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# Config file integration
+# ---------------------------------------------------------------------------
+
+class TestConfigIntegration:
+    def test_ignore_rules_from_config(self, runner, tmp_path):
+        """Config ignore_rules should suppress matching findings."""
+        import shutil
+        shutil.copy(INSECURE_FIXTURE, tmp_path / "insecure-example.yml")
+        cfg = tmp_path / ".gha-guard.yml"
+        cfg.write_text(
+            "ignore_rules:\n"
+            "  - unpinned-action\n"
+            "  - dangerous-trigger\n"
+            "  - secret-in-run\n"
+            "  - write-all-permissions\n"
+            "  - script-injection\n"
+            "  - missing-permissions\n"
+            "  - manual-trigger\n"
+        )
+        result = runner.invoke(cli, [
+            "scan", str(tmp_path / "insecure-example.yml"),
+            "--config", str(cfg),
+        ])
+        assert result.exit_code == EXIT_OK
+        assert "No security issues found" in result.output
+
+    def test_severity_from_config(self, runner, tmp_path):
+        """Config severity should filter findings."""
+        import shutil
+        shutil.copy(INSECURE_FIXTURE, tmp_path / "insecure-example.yml")
+        cfg = tmp_path / ".gha-guard.yml"
+        cfg.write_text("severity: critical\n")
+        result = runner.invoke(cli, [
+            "scan", str(tmp_path / "insecure-example.yml"),
+            "--config", str(cfg),
+            "--format", "json",
+        ])
+        import json
+        parsed = json.loads(result.output)
+        for f in parsed["findings"]:
+            assert f["severity"] == "critical"
+
+    def test_cli_severity_overrides_config(self, runner, tmp_path):
+        """CLI --severity flag should override config file."""
+        import shutil
+        shutil.copy(INSECURE_FIXTURE, tmp_path / "insecure-example.yml")
+        cfg = tmp_path / ".gha-guard.yml"
+        cfg.write_text("severity: low\n")
+        result = runner.invoke(cli, [
+            "scan", str(tmp_path / "insecure-example.yml"),
+            "--config", str(cfg),
+            "--severity", "critical",
+            "--format", "json",
+        ])
+        import json
+        parsed = json.loads(result.output)
+        for f in parsed["findings"]:
+            assert f["severity"] == "critical"
+
+    def test_exclude_from_config(self, runner, tmp_path):
+        """Config exclude should skip matching workflow files."""
+        import shutil
+        wf_dir = tmp_path / "workflows"
+        wf_dir.mkdir()
+        shutil.copy(INSECURE_FIXTURE, wf_dir / "insecure-example.yml")
+        shutil.copy(SECURE_FIXTURE, wf_dir / "secure-example.yml")
+        cfg = tmp_path / ".gha-guard.yml"
+        cfg.write_text("exclude:\n  - '**/insecure-*'\n")
+        result = runner.invoke(cli, [
+            "scan", str(wf_dir),
+            "--config", str(cfg),
+        ])
+        assert result.exit_code == EXIT_OK
+        assert "No security issues found" in result.output

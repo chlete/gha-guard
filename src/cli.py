@@ -20,6 +20,7 @@ Exit codes:
   2 — error (bad input, missing API key, etc.)
 """
 
+import fnmatch
 import logging
 import os
 import sys
@@ -27,6 +28,7 @@ import sys
 import click
 import yaml
 
+from src.config import load_config
 from src.parser import parse_workflow, parse_workflows_dir
 from src.rules import run_all_rules, Severity
 from src.reporter import report_console, report_json
@@ -60,8 +62,9 @@ def cli(verbose: bool):
 @click.argument("path")
 @click.option("--enrich", is_flag=True, help="Use Claude AI to explain findings and suggest fixes.")
 @click.option("--format", "output_format", type=click.Choice(["console", "json"]), default="console", help="Output format.")
-@click.option("--severity", "min_severity", type=click.Choice(["critical", "high", "medium", "low"]), default="low", help="Minimum severity to report.")
-def scan(path: str, enrich: bool, output_format: str, min_severity: str):
+@click.option("--severity", "min_severity", type=click.Choice(["critical", "high", "medium", "low"]), default=None, help="Minimum severity to report (overrides config file).")
+@click.option("--config", "config_path", default=None, help="Path to .gha-guard.yml config file.")
+def scan(path: str, enrich: bool, output_format: str, min_severity: str, config_path: str):
     """Scan GitHub Actions workflow files for security issues.
 
     Exits with code 0 if no issues found, 1 if issues found, 2 on error.
@@ -72,9 +75,13 @@ def scan(path: str, enrich: bool, output_format: str, min_severity: str):
         Severity.HIGH: 2,
         Severity.CRITICAL: 3,
     }
-    min_sev = Severity(min_severity)
 
     path = os.path.abspath(path)
+
+    # Load config file (CLI flags override config values)
+    config = load_config(config_path=config_path, scan_path=path)
+    effective_severity = min_severity or config.severity
+    min_sev = Severity(effective_severity)
 
     # Parse workflows
     try:
@@ -96,11 +103,37 @@ def scan(path: str, enrich: bool, output_format: str, min_severity: str):
         click.echo("No workflow files found.")
         sys.exit(EXIT_OK)
 
+    # Apply exclude patterns from config
+    if config.exclude:
+        before = len(workflows)
+        workflows = [
+            wf for wf in workflows
+            if not any(fnmatch.fnmatch(wf.file_path, pat) for pat in config.exclude)
+        ]
+        excluded = before - len(workflows)
+        if excluded:
+            logger.info("Excluded %d workflow(s) via config", excluded)
+
+    if not workflows:
+        click.echo("All workflow files excluded by config.")
+        sys.exit(EXIT_OK)
+
     # Run rules on all workflows
     all_findings = []
     for wf in workflows:
         findings = run_all_rules(wf)
         all_findings.extend(findings)
+
+    # Filter by ignored rules from config
+    if config.ignore_rules:
+        before = len(all_findings)
+        all_findings = [
+            f for f in all_findings
+            if f.rule_id not in config.ignore_rules
+        ]
+        ignored = before - len(all_findings)
+        if ignored:
+            logger.info("Ignored %d finding(s) via config ignore_rules", ignored)
 
     # Filter by minimum severity
     all_findings = [
