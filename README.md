@@ -13,6 +13,7 @@ An AI-enhanced CLI tool that scans GitHub Actions workflow files for security vu
 | `missing-permissions` | MEDIUM | Workflows without an explicit permissions block |
 | `script-injection` | CRITICAL | User-controlled values used directly in `run:` blocks |
 | `dangerous-trigger` | HIGH | Use of `pull_request_target` trigger |
+| `manual-trigger` | LOW | Workflow can be triggered manually via `workflow_dispatch` |
 | `secret-in-run` | HIGH | Secrets referenced directly in shell commands |
 
 ## Setup
@@ -37,11 +38,20 @@ python3 -m src scan path/to/workflow.yml
 # Output as JSON
 python3 -m src scan path/to/.github/workflows/ --format json
 
+# Output as SARIF (for GitHub Code Scanning)
+python3 -m src scan path/to/.github/workflows/ --format sarif > results.sarif
+
 # Only show critical findings
 python3 -m src scan path/to/.github/workflows/ --severity critical
 
 # Verbose logging
 python3 -m src -v scan path/to/.github/workflows/
+
+# Write full debug logs to a file
+python3 -m src --log-file scan.log scan path/to/.github/workflows/
+
+# Use an explicit config file
+python3 -m src scan path/to/.github/workflows/ --config path/to/.gha-guard.yml
 ```
 
 ### AI-enhanced scan (requires Anthropic API key)
@@ -51,7 +61,7 @@ export ANTHROPIC_API_KEY=your-key-here
 python3 -m src scan path/to/.github/workflows/ --enrich
 ```
 
-The `--enrich` flag sends each finding to Claude, which returns:
+The `--enrich` flag sends all findings to Claude in a single batched call, which returns:
 - A beginner-friendly explanation of the risk
 - A concrete YAML fix suggestion
 
@@ -62,6 +72,50 @@ The `--enrich` flag sends each finding to Claude, which returns:
 | `0` | No findings — clean scan |
 | `1` | Findings detected |
 | `2` | Error (bad input, missing API key, etc.) |
+
+## GitHub Code Scanning (SARIF)
+
+Generate a SARIF file and upload it to GitHub Code Scanning so findings appear as annotations directly on the PR diff:
+
+```yaml
+# .github/workflows/security.yml
+- name: Scan workflows
+  run: python3 -m src scan .github/workflows/ --format sarif > results.sarif
+
+- name: Upload to GitHub Code Scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
+```
+
+Findings will appear in the **Security → Code scanning** tab and as inline annotations on pull requests.
+
+## Pre-commit integration
+
+Add gha-guard to your `.pre-commit-config.yaml` to run it automatically before every commit:
+
+```yaml
+repos:
+  - repo: https://github.com/chlete/gha-guard
+    rev: v0.1.0-alpha  # pin to a release tag
+    hooks:
+      - id: gha-guard
+```
+
+Then install the hook:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+From now on, every `git commit` will scan your `.github/workflows/` files. The commit is blocked if any findings are detected (exit code 1).
+
+To run manually against all files:
+
+```bash
+pre-commit run gha-guard --all-files
+```
 
 ## Configuration
 

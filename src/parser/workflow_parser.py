@@ -16,6 +16,22 @@ import yaml
 logger = logging.getLogger(__name__)
 
 
+class _LineLoader(yaml.SafeLoader):
+    """PyYAML loader that stores the start line number on every mapping node."""
+
+
+def _construct_mapping(loader: _LineLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+    mapping: dict[Any, Any] = loader.construct_mapping(node, deep=True)
+    mapping["__line__"] = node.start_mark.line + 1  # YAML lines are 0-indexed
+    return mapping
+
+
+_LineLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping,
+)
+
+
 @dataclass
 class ActionRef:
     """A reference to a GitHub Action used in a step."""
@@ -35,6 +51,7 @@ class Step:
     env: dict[str, str]
     with_args: dict[str, Any]
     raw: dict[str, Any]
+    line_number: Optional[int] = None
 
 
 @dataclass
@@ -47,6 +64,7 @@ class Job:
     steps: list[Step]
     env: dict[str, str]
     raw: dict[str, Any]
+    line_number: Optional[int] = None
 
 
 @dataclass
@@ -59,6 +77,7 @@ class Workflow:
     env: dict[str, str]
     jobs: list[Job]
     raw: dict[str, Any]
+    line_number: Optional[int] = None
 
 
 def _parse_action_ref(uses_string: str) -> Optional[ActionRef]:
@@ -108,6 +127,7 @@ def _parse_step(step_raw: dict[str, Any]) -> Step:
         env=step_raw.get("env", {}),
         with_args=step_raw.get("with", {}),
         raw=step_raw,
+        line_number=step_raw.get("__line__"),
     )
 
 
@@ -136,7 +156,7 @@ def _parse_permissions(perm_field: Union[str, dict[str, str], None]) -> Optional
 
 def _parse_job(job_id: str, job_raw: dict[str, Any]) -> Job:
     """Parse a raw job dictionary into a Job dataclass."""
-    steps_raw = job_raw.get("steps", [])
+    steps_raw = [s for s in job_raw.get("steps", []) if isinstance(s, dict)]
     logger.debug("Parsing job '%s' with %d step(s)", job_id, len(steps_raw))
     return Job(
         job_id=job_id,
@@ -146,6 +166,7 @@ def _parse_job(job_id: str, job_raw: dict[str, Any]) -> Job:
         steps=[_parse_step(s) for s in steps_raw],
         env=job_raw.get("env", {}),
         raw=job_raw,
+        line_number=job_raw.get("__line__"),
     )
 
 
@@ -170,14 +191,18 @@ def parse_workflow(file_path: str) -> Workflow:
     logger.info("Parsing workflow: %s", file_path)
 
     with open(path, "r") as f:
-        raw = yaml.safe_load(f)
+        raw = yaml.load(f, Loader=_LineLoader)  # noqa: S506  # _LineLoader is safe
 
     if not isinstance(raw, dict):
         logger.error("File is not a valid YAML mapping: %s", file_path)
         raise ValueError(f"Workflow file is not a valid YAML mapping: {file_path}")
 
     jobs_raw = raw.get("jobs", {})
-    jobs = [_parse_job(job_id, job_data) for job_id, job_data in jobs_raw.items()]
+    jobs = [
+        _parse_job(job_id, job_data)
+        for job_id, job_data in jobs_raw.items()
+        if job_id != "__line__"
+    ]
     triggers = _parse_triggers(raw.get("on", raw.get(True, [])))
     permissions = _parse_permissions(raw.get("permissions"))
     logger.debug(
@@ -194,6 +219,7 @@ def parse_workflow(file_path: str) -> Workflow:
         env=raw.get("env", {}),
         jobs=jobs,
         raw=raw,
+        line_number=raw.get("__line__"),
     )
 
 

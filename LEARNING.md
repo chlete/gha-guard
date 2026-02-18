@@ -16,6 +16,7 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [LLM Layer](#4-llm-layer)
    - [CLI](#5-cli)
    - [Config](#6-config)
+   - [Pre-commit Integration](#7-pre-commit-integration)
 5. [Python Concepts Used](#python-concepts-used)
    - [Dataclasses](#dataclasses)
    - [Decorators and the Registry Pattern](#decorators-and-the-registry-pattern)
@@ -27,7 +28,9 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [Exit Codes](#exit-codes)
    - [Structured Logging](#structured-logging)
    - [Type Checking with mypy](#type-checking-with-mypy)
-   - [LLM Batching — One Call for All Findings](#llm-batching--one-call-for-all-findings)
+   - [Pre-commit Hooks](#pre-commit-hooks)
+   - [SARIF Output and GitHub Code Scanning](#sarif-output-and-github-code-scanning)
+   - [Line Number Tracking in the Parser](#line-number-tracking-in-the-parser)
    - [Config File Auto-Discovery](#config-file-auto-discovery)
 7. [Testing Philosophy](#testing-philosophy)
 
@@ -168,17 +171,19 @@ if "uses" in step and "@" in step["uses"]:
 **The hierarchy:**
 
 ```
-Workflow          ← one per .yml file
+Workflow          ← one per .yml file, line_number = 1
 ├── triggers      ← ["push", "pull_request_target"]
 ├── permissions   ← {"_all": "write-all"} or {"contents": "read"}
 └── jobs[]
-    └── Job
+    └── Job       ← line_number = line of "build:" in YAML
         ├── permissions
         └── steps[]
-            └── Step
+            └── Step  ← line_number = line of "- name:" in YAML
                 ├── uses → ActionRef (or None)
                 └── run  → string (or None)
 ```
+
+Every `Workflow`, `Job`, and `Step` carries a `line_number` — the exact source line where that node starts in the YAML file. This flows into `Finding.line_number`, which the SARIF reporter uses to produce precise inline annotations on the PR diff.
 
 The parser is a **translator** between raw YAML (messy, untyped) and this clean structure. It runs once, and from that point on, nothing else touches raw YAML.
 
@@ -233,18 +238,20 @@ This is the "contract" between rules and reporters. Rules produce findings, repo
 
 ### 3. Reporter
 
-**Files:** `src/reporter/console_reporter.py`, `json_reporter.py`, `enriched_reporter.py`
+**Files:** `src/reporter/console_reporter.py`, `json_reporter.py`, `enriched_reporter.py`, `sarif_reporter.py`
 
 **What it does:** Takes a list of `Finding` objects and formats them for output.
 
-Three formats:
+Four formats:
 - **Console** — colored terminal output with ANSI escape codes
 - **JSON** — structured data for piping to other tools
 - **Enriched** — console output with LLM explanations added
+- **SARIF** — standard format for GitHub Code Scanning integration
 
-**Why three?** Different use cases:
+**Why four?** Different use cases:
 - A human running the tool locally wants colored console output
 - A CI pipeline wants JSON to parse programmatically
+- A GitHub Actions workflow wants SARIF to show findings as PR annotations
 - A developer learning about security wants the enriched explanations
 
 Each reporter is a pure function: `list[Finding] → string`. No side effects, easy to test.
@@ -428,6 +435,58 @@ This means you can put the config at the repo root and scan from any subdirector
 **CLI overrides config:**
 
 If you have `severity: low` in the config but pass `--severity critical` on the command line, the CLI wins. This follows the principle of **least surprise** — explicit is better than implicit.
+
+---
+
+### 7. Pre-commit Integration
+
+**File:** `.pre-commit-hooks.yaml`
+
+**What it does:** Lets users plug gha-guard into the [pre-commit](https://pre-commit.com/) framework so it runs automatically before every `git commit`.
+
+**Why this matters:**
+
+Right now, a developer has to remember to run `gha-guard scan` manually. They won't. Security tools only work if they run automatically at the right moment — and the right moment is before code is committed, not after it's already in a PR.
+
+Pre-commit is a widely adopted framework for this. Users add a `.pre-commit-config.yaml` to their repo:
+
+```yaml
+repos:
+  - repo: https://github.com/chlete/gha-guard
+    rev: v0.1.0-alpha
+    hooks:
+      - id: gha-guard
+```
+
+After `pre-commit install`, every `git commit` automatically runs gha-guard against the `.github/workflows/` files. If any findings are detected, the commit is **blocked** (exit code 1). The developer sees the findings and fixes them before the code ever leaves their machine.
+
+**How `.pre-commit-hooks.yaml` works:**
+
+This file is what the pre-commit framework reads from a hook repository. It declares:
+
+```yaml
+- id: gha-guard           # the hook ID users reference
+  name: gha-guard         # display name in terminal output
+  language: python        # pre-commit installs this as a Python package
+  entry: gha-guard scan   # the command to run
+  files: ^.github/workflows/.*\.(yml|yaml)$  # only run on workflow files
+  pass_filenames: false   # scan the whole directory, not individual files
+```
+
+The `files` pattern means the hook only triggers when a `.github/workflows/` file is staged. If you're committing a Python file, gha-guard doesn't run at all — no unnecessary overhead.
+
+`pass_filenames: false` is important: pre-commit normally passes the list of changed files as arguments to the command. We don't want that — we want to scan the whole workflows directory, not just the files being committed (a changed file might interact with an unchanged one).
+
+**The shift-left principle:**
+
+This is an example of "shift left" in security — moving checks earlier in the development process. The earlier you catch a problem, the cheaper it is to fix:
+
+```
+Developer's machine → PR review → CI → Production
+     ↑ cheapest                              ↑ most expensive
+```
+
+A pre-commit hook catches issues at the cheapest possible point.
 
 ---
 
@@ -796,85 +855,118 @@ python3 -m mypy src/
 
 It's also in CI (`python-app.yml`) so every PR is checked automatically.
 
-### LLM Batching — One Call for All Findings
+### SARIF Output and GitHub Code Scanning
 
-#### The problem with one call per finding
+SARIF (Static Analysis Results Interchange Format) is a JSON standard that GitHub's Code Scanning feature understands. When you upload a SARIF file, findings appear as **inline annotations on the PR diff** in the Security tab — the reviewer sees the issue right next to the code that caused it.
 
-The original implementation looped over findings and made a separate API call for each:
+**The SARIF structure:**
 
-```python
-for finding in findings:
-    response = client.messages.create(...)  # one call per finding
-```
-
-For a workflow with 7 findings, that's 7 API calls. Each call:
-- Sends the full workflow YAML again (repeated tokens = repeated cost)
-- Waits for a round-trip to the API (sequential latency adds up)
-- Has its own rate-limit budget consumed
-
-For large repos with many workflows and many findings, this is slow and expensive.
-
-#### The batched design
-
-All findings are sent in a single prompt. Claude returns a JSON **array** — one object per finding, in the same order:
-
-```python
-# Prompt structure (simplified):
-"""
-Here are 7 security finding(s):
-
-Finding 1:
-  Rule ID: unpinned-action
-  ...
-
-Finding 2:
-  Rule ID: write-all-permissions
-  ...
-
-Here is the full workflow YAML:
-...
-
-Respond with the JSON array only.
-"""
-```
-
-Claude responds with:
 ```json
-[
-  {"explanation": "...", "suggested_fix": "..."},
-  {"explanation": "...", "suggested_fix": "..."},
-  ...
+{
+  "version": "2.1.0",
+  "runs": [{
+    "tool": {
+      "driver": {
+        "name": "gha-guard",
+        "rules": [
+          {
+            "id": "unpinned-action",
+            "shortDescription": {"text": "Unpinned action reference"},
+            "properties": {"security-severity": "7.0"}
+          }
+        ]
+      }
+    },
+    "results": [
+      {
+        "ruleId": "unpinned-action",
+        "level": "error",
+        "message": {"text": "Action is not pinned to a SHA."},
+        "locations": [{"physicalLocation": {"artifactLocation": {"uri": ".github/workflows/ci.yml"}}}]
+      }
+    ]
+  }]
+}
+```
+
+Key design decisions:
+
+- **`security-severity`** is a numeric score (0.0–10.0) that GitHub uses to classify findings. We map our severities: CRITICAL=9.0, HIGH=7.0, MEDIUM=5.0, LOW=3.0.
+- **`level`** controls the annotation colour: `error` (red), `warning` (yellow), `note` (blue). CRITICAL and HIGH both map to `error` — both should block a PR.
+- **Rules are deduplicated** — if 3 findings share the same `rule_id`, the `rules` array still has one entry. Results reference rules by ID.
+- **`logicalLocations`** carry the job and step names, giving GitHub extra context beyond just the file path.
+- **`pass_filenames: false`** — we don't have line numbers (the YAML parser doesn't track them), so we point all findings to `startLine: 1`. This is valid SARIF — GitHub still shows the annotation on the file.
+
+**How to use it in CI:**
+
+```yaml
+- name: Scan workflows
+  run: python3 -m src scan .github/workflows/ --format sarif > results.sarif
+
+- name: Upload to GitHub Code Scanning
+  uses: github/codeql-action/upload-sarif@v3
+  with:
+    sarif_file: results.sarif
+```
+
+### Pre-commit Hooks
+
+The `.pre-commit-hooks.yaml` file is a standard contract that the pre-commit framework reads. By adding it to the repo root, gha-guard becomes a first-class pre-commit hook that any project can adopt with two lines of config.
+
+The key design choice is `pass_filenames: false`. Pre-commit normally passes staged filenames as arguments — useful for linters that check individual files. But gha-guard scans a directory holistically (a workflow might reference another workflow), so we always scan the full `.github/workflows/` directory regardless of which files were staged.
+
+The `files` pattern (`^.github/workflows/.*\.(yml|yaml)$`) ensures the hook only activates when a workflow file is part of the commit. No workflow changes = hook skipped entirely.
+
+### Line Number Tracking in the Parser
+
+Python's `pyyaml` doesn't expose line numbers by default — `yaml.safe_load()` returns plain Python dicts with no source location information. To get line numbers we use a custom `Loader` subclass that hooks into PyYAML's node construction:
+
+```python
+class _LineLoader(yaml.SafeLoader):
+    """PyYAML loader that stores the start line on every mapping node."""
+
+def _construct_mapping(loader, node):
+    mapping = loader.construct_mapping(node, deep=True)
+    mapping["__line__"] = node.start_mark.line + 1  # 0-indexed → 1-indexed
+    return mapping
+
+_LineLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping,
+)
+```
+
+Every time PyYAML constructs a YAML mapping (i.e. a `{}` dict), our hook runs and injects `__line__` into it. The `node.start_mark.line` is the 0-indexed line where that mapping starts in the file — we add 1 to make it 1-indexed (matching what editors show).
+
+**The `__line__` key must be filtered out** when iterating over YAML structure. For example, the `jobs:` mapping now has a `__line__` key alongside the actual job IDs:
+
+```python
+# jobs_raw looks like: {"build": {...}, "deploy": {...}, "__line__": 10}
+jobs = [
+    _parse_job(job_id, job_data)
+    for job_id, job_data in jobs_raw.items()
+    if job_id != "__line__"   # ← must filter
 ]
 ```
 
-One call. One response. The workflow YAML is sent once.
-
-#### Why a JSON array works reliably
-
-Claude is very good at following structured output instructions when the format is explicit. The system prompt says:
-
-> *"The array must have exactly as many objects as there are findings, in the same order."*
-
-This gives Claude a clear contract. The order guarantee is important — it's how we match each response back to its finding using `zip(findings, items)`.
-
-#### Handling the failure case
-
-What if Claude returns a malformed array, or the wrong number of items? We validate explicitly:
+Similarly, the `steps:` list can contain the `__line__` integer from the parent mapping, so we filter to only `dict` items:
 
 ```python
-if not isinstance(items, list) or len(items) != len(findings):
-    raise ValueError(...)
+steps_raw = [s for s in job_raw.get("steps", []) if isinstance(s, dict)]
 ```
 
-If validation fails, we fall back gracefully — every finding gets the raw response text as its explanation rather than crashing. This is a deliberate trade-off: **partial information is better than a hard failure**.
+**How it flows through the stack:**
 
-#### `max_tokens` increase
+```
+YAML node.start_mark.line
+    → __line__ key in raw dict
+    → Step.line_number / Job.line_number / Workflow.line_number
+    → Finding.line_number
+    → SARIF region.startLine  (precise PR annotation)
+    → JSON output line_number field
+```
 
-The original code used `max_tokens=1024` (enough for one finding's response). With batching, Claude needs to produce output for all findings. We increased this to `max_tokens=4096` to give it enough room.
-
-#### The trade-off
-
-Batching is almost always better, but there's one downside: if the response is malformed, **all findings** lose their enrichment rather than just one. The fallback mitigates this, but it's worth knowing. For very large numbers of findings (50+), chunking into groups would be the next step.
+The `line_number` field is `Optional[int]` everywhere — if a node somehow doesn't have it (e.g. inline YAML or edge cases), everything still works, falling back to `startLine: 1` in SARIF.
 
 ### Config File Auto-Discovery
 

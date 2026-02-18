@@ -31,6 +31,7 @@ def check_dangerous_triggers(workflow: Workflow) -> list[Finding]:
             file_path=workflow.file_path,
             job_id="",
             step_name="",
+            line_number=workflow.line_number,
         ))
 
     if "workflow_dispatch" in workflow.triggers:
@@ -47,6 +48,7 @@ def check_dangerous_triggers(workflow: Workflow) -> list[Finding]:
             file_path=workflow.file_path,
             job_id="",
             step_name="",
+            line_number=workflow.line_number,
         ))
 
     return findings
