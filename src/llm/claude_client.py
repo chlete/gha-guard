@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from anthropic import Anthropic
+from anthropic.types import TextBlock
 
 from src.rules.engine import Finding
 
@@ -123,8 +124,9 @@ def enrich_findings(
             finding.rule_id, elapsed_ms, input_tokens, output_tokens,
         )
 
-        # Parse the JSON response
-        response_text = response.content[0].text.strip()
+        # Parse the JSON response — filter to TextBlock only (other block types lack .text)
+        text_blocks = [b for b in response.content if isinstance(b, TextBlock)]
+        response_text = text_blocks[0].text.strip() if text_blocks else ""
         logger.debug("Raw response (%d chars): %.200s", len(response_text), response_text)
         try:
             data = json.loads(response_text)

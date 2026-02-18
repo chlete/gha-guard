@@ -24,6 +24,7 @@ import fnmatch
 import logging
 import os
 import sys
+from typing import Optional
 
 import click
 import yaml
@@ -41,7 +42,7 @@ EXIT_FINDINGS = 1
 EXIT_ERROR = 2
 
 
-def _setup_logging(verbose: bool, log_file: str = None) -> None:
+def _setup_logging(verbose: bool, log_file: Optional[str] = None) -> None:
     """Configure logging based on verbosity and optional log file."""
     root = logging.getLogger()
     # Remove any previously attached handlers (important when called multiple times)
@@ -71,7 +72,7 @@ def _setup_logging(verbose: bool, log_file: str = None) -> None:
 @click.group()
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging.")
 @click.option("--log-file", default=None, type=click.Path(), help="Write debug logs to a file.")
-def cli(verbose: bool, log_file: str):
+def cli(verbose: bool, log_file: Optional[str]) -> None:
     """GitHub Actions Security Scanner — find and fix CI/CD vulnerabilities."""
     _setup_logging(verbose, log_file)
 
@@ -82,7 +83,7 @@ def cli(verbose: bool, log_file: str):
 @click.option("--format", "output_format", type=click.Choice(["console", "json"]), default="console", help="Output format.")
 @click.option("--severity", "min_severity", type=click.Choice(["critical", "high", "medium", "low"]), default=None, help="Minimum severity to report (overrides config file).")
 @click.option("--config", "config_path", default=None, help="Path to .gha-guard.yml config file.")
-def scan(path: str, enrich: bool, output_format: str, min_severity: str, config_path: str):
+def scan(path: str, enrich: bool, output_format: str, min_severity: Optional[str], config_path: Optional[str]) -> None:
     """Scan GitHub Actions workflow files for security issues.
 
     Exits with code 0 if no issues found, 1 if issues found, 2 on error.

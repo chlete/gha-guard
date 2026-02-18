@@ -4,6 +4,7 @@ import json
 from unittest.mock import patch, MagicMock
 
 import pytest
+from anthropic.types import TextBlock
 
 from src.rules.engine import Finding, Severity
 from src.llm.claude_client import enrich_findings, _build_user_prompt, EnrichedFinding
@@ -33,12 +34,13 @@ SAMPLE_YAML = "name: Test\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest
 def _mock_claude_response(explanation, suggested_fix):
     """Create a mock Anthropic API response."""
     response = MagicMock()
-    content_block = MagicMock()
-    content_block.text = json.dumps({
-        "explanation": explanation,
-        "suggested_fix": suggested_fix,
-    })
-    response.content = [content_block]
+    response.content = [TextBlock(
+        type="text",
+        text=json.dumps({
+            "explanation": explanation,
+            "suggested_fix": suggested_fix,
+        }),
+    )]
     return response
 
 
@@ -110,9 +112,7 @@ class TestEnrichFindings:
         mock_anthropic_cls.return_value = mock_client
 
         response = MagicMock()
-        content_block = MagicMock()
-        content_block.text = "This is not JSON, just plain text."
-        response.content = [content_block]
+        response.content = [TextBlock(type="text", text="This is not JSON, just plain text.")]
         mock_client.messages.create.return_value = response
 
         findings = [_make_finding()]
