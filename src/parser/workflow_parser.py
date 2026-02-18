@@ -1,0 +1,202 @@
+"""
+Parser for GitHub Actions workflow files.
+
+Reads .yml/.yaml files from a workflows directory and normalizes them
+into a structured format that security rules can analyze.
+"""
+
+import os
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
+
+import yaml
+
+
+@dataclass
+class ActionRef:
+    """A reference to a GitHub Action used in a step."""
+    full_ref: str       # e.g. "actions/checkout@v3"
+    owner: str          # e.g. "actions"
+    repo: str           # e.g. "checkout"
+    ref: str            # e.g. "v3" or a SHA
+    is_pinned: bool     # True if ref is a full 40-char SHA
+
+
+@dataclass
+class Step:
+    """A single step within a job."""
+    name: Optional[str]
+    uses: Optional[ActionRef]
+    run: Optional[str]
+    env: dict
+    with_args: dict
+    raw: dict
+
+
+@dataclass
+class Job:
+    """A single job within a workflow."""
+    job_id: str
+    name: Optional[str]
+    runs_on: str
+    permissions: Optional[dict]
+    steps: list[Step]
+    env: dict
+    raw: dict
+
+
+@dataclass
+class Workflow:
+    """A parsed GitHub Actions workflow."""
+    file_path: str
+    name: Optional[str]
+    triggers: list[str]
+    permissions: Optional[dict]
+    env: dict
+    jobs: list[Job]
+    raw: dict
+
+
+def _parse_action_ref(uses_string: str) -> Optional[ActionRef]:
+    """Parse an action reference like 'actions/checkout@v3' into components."""
+    if not uses_string or "/" not in uses_string:
+        return None
+
+    # Handle docker:// and ./ (local) actions
+    if uses_string.startswith("docker://") or uses_string.startswith("./"):
+        return None
+
+    # Split owner/repo@ref
+    if "@" not in uses_string:
+        return None
+
+    action_path, ref = uses_string.rsplit("@", 1)
+    parts = action_path.split("/")
+    if len(parts) < 2:
+        return None
+
+    owner = parts[0]
+    repo = parts[1]
+
+    # A full SHA-1 hash is 40 hex characters
+    is_pinned = len(ref) == 40 and all(c in "0123456789abcdef" for c in ref.lower())
+
+    return ActionRef(
+        full_ref=uses_string,
+        owner=owner,
+        repo=repo,
+        ref=ref,
+        is_pinned=is_pinned,
+    )
+
+
+def _parse_step(step_raw: dict) -> Step:
+    """Parse a raw step dictionary into a Step dataclass."""
+    uses_str = step_raw.get("uses")
+    return Step(
+        name=step_raw.get("name"),
+        uses=_parse_action_ref(uses_str) if uses_str else None,
+        run=step_raw.get("run"),
+        env=step_raw.get("env", {}),
+        with_args=step_raw.get("with", {}),
+        raw=step_raw,
+    )
+
+
+def _parse_triggers(on_field) -> list[str]:
+    """Normalize the 'on' field into a list of trigger names."""
+    if isinstance(on_field, str):
+        return [on_field]
+    elif isinstance(on_field, list):
+        return on_field
+    elif isinstance(on_field, dict):
+        return list(on_field.keys())
+    return []
+
+
+def _parse_permissions(perm_field) -> Optional[dict]:
+    """Normalize the permissions field into a dict or None."""
+    if perm_field is None:
+        return None
+    if isinstance(perm_field, str):
+        # e.g. "read-all" or "write-all"
+        return {"_all": perm_field}
+    if isinstance(perm_field, dict):
+        return perm_field
+    return None
+
+
+def _parse_job(job_id: str, job_raw: dict) -> Job:
+    """Parse a raw job dictionary into a Job dataclass."""
+    steps_raw = job_raw.get("steps", [])
+    return Job(
+        job_id=job_id,
+        name=job_raw.get("name"),
+        runs_on=str(job_raw.get("runs-on", "")),
+        permissions=_parse_permissions(job_raw.get("permissions")),
+        steps=[_parse_step(s) for s in steps_raw],
+        env=job_raw.get("env", {}),
+        raw=job_raw,
+    )
+
+
+def parse_workflow(file_path: str) -> Workflow:
+    """
+    Parse a single GitHub Actions workflow YAML file.
+
+    Args:
+        file_path: Path to the .yml/.yaml workflow file.
+
+    Returns:
+        A Workflow dataclass with normalized data.
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist.
+        yaml.YAMLError: If the file isn't valid YAML.
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Workflow file not found: {file_path}")
+
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f)
+
+    if not isinstance(raw, dict):
+        raise ValueError(f"Workflow file is not a valid YAML mapping: {file_path}")
+
+    jobs_raw = raw.get("jobs", {})
+    jobs = [_parse_job(job_id, job_data) for job_id, job_data in jobs_raw.items()]
+
+    return Workflow(
+        file_path=str(path),
+        name=raw.get("name"),
+        triggers=_parse_triggers(raw.get("on", raw.get(True, []))),
+        permissions=_parse_permissions(raw.get("permissions")),
+        env=raw.get("env", {}),
+        jobs=jobs,
+        raw=raw,
+    )
+
+
+def parse_workflows_dir(dir_path: str) -> list[Workflow]:
+    """
+    Parse all workflow files in a directory.
+
+    Args:
+        dir_path: Path to a directory containing .yml/.yaml files
+                  (typically .github/workflows/).
+
+    Returns:
+        A list of parsed Workflow objects.
+    """
+    path = Path(dir_path)
+    if not path.is_dir():
+        raise NotADirectoryError(f"Not a directory: {dir_path}")
+
+    workflows = []
+    for file in sorted(path.iterdir()):
+        if file.suffix in (".yml", ".yaml"):
+            workflows.append(parse_workflow(str(file)))
+
+    return workflows

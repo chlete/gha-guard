@@ -1,0 +1,43 @@
+name: Insecure CI Example
+
+on:
+  pull_request_target:
+  push:
+    branches: [main]
+
+permissions: write-all
+
+env:
+  NODE_ENV: production
+
+jobs:
+  build:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: "18"
+
+      - name: Greet PR author
+        run: |
+          echo "Hello ${{ github.event.pull_request.title }}"
+
+      - name: Run tests
+        run: npm test
+        env:
+          SECRET_KEY: ${{ secrets.API_KEY }}
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@af513c7a016048ae468971c52ed77d9562c7c819
+      - uses: some-org/deploy-action@main
+      - run: |
+          curl -X POST https://example.com/deploy \
+            -H "Authorization: Bearer ${{ secrets.DEPLOY_TOKEN }}"
