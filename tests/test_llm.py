@@ -31,15 +31,15 @@ def _make_finding(**overrides):
 SAMPLE_YAML = "name: Test\non: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n"
 
 
-def _mock_claude_response(explanation, suggested_fix):
-    """Create a mock Anthropic API response."""
+def _mock_claude_response(*pairs):
+    """Create a mock Anthropic API response for one or more (explanation, fix) pairs."""
     response = MagicMock()
     response.content = [TextBlock(
         type="text",
-        text=json.dumps({
-            "explanation": explanation,
-            "suggested_fix": suggested_fix,
-        }),
+        text=json.dumps([
+            {"explanation": explanation, "suggested_fix": fix}
+            for explanation, fix in pairs
+        ]),
     )]
     return response
 
@@ -51,23 +51,34 @@ def _mock_claude_response(explanation, suggested_fix):
 class TestBuildUserPrompt:
     def test_includes_rule_id(self):
         finding = _make_finding(rule_id="my-rule")
-        prompt = _build_user_prompt(finding, SAMPLE_YAML)
+        prompt = _build_user_prompt([finding], SAMPLE_YAML)
         assert "my-rule" in prompt
 
     def test_includes_severity(self):
         finding = _make_finding(severity=Severity.CRITICAL)
-        prompt = _build_user_prompt(finding, SAMPLE_YAML)
+        prompt = _build_user_prompt([finding], SAMPLE_YAML)
         assert "critical" in prompt
 
     def test_includes_workflow_yaml(self):
-        prompt = _build_user_prompt(_make_finding(), SAMPLE_YAML)
+        prompt = _build_user_prompt([_make_finding()], SAMPLE_YAML)
         assert "name: Test" in prompt
 
     def test_includes_job_and_step(self):
         finding = _make_finding(job_id="deploy", step_name="Push image")
-        prompt = _build_user_prompt(finding, SAMPLE_YAML)
+        prompt = _build_user_prompt([finding], SAMPLE_YAML)
         assert "deploy" in prompt
         assert "Push image" in prompt
+
+    def test_includes_all_findings_in_batch(self):
+        findings = [
+            _make_finding(rule_id="rule-a"),
+            _make_finding(rule_id="rule-b"),
+        ]
+        prompt = _build_user_prompt(findings, SAMPLE_YAML)
+        assert "rule-a" in prompt
+        assert "rule-b" in prompt
+        assert "Finding 1" in prompt
+        assert "Finding 2" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +91,7 @@ class TestEnrichFindings:
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
         mock_client.messages.create.return_value = _mock_claude_response(
-            "This is dangerous because...",
-            "uses: actions/checkout@abc123...",
+            ("This is dangerous because...", "uses: actions/checkout@abc123..."),
         )
 
         findings = [_make_finding()]
@@ -93,18 +103,49 @@ class TestEnrichFindings:
         assert enriched[0].finding == findings[0]
 
     @patch("src.llm.claude_client.Anthropic")
-    def test_handles_multiple_findings(self, mock_anthropic_cls):
+    def test_handles_multiple_findings_in_one_call(self, mock_anthropic_cls):
         mock_client = MagicMock()
         mock_anthropic_cls.return_value = mock_client
         mock_client.messages.create.return_value = _mock_claude_response(
-            "Explanation", "Fix"
+            ("Explanation A", "Fix A"),
+            ("Explanation B", "Fix B"),
         )
 
         findings = [_make_finding(), _make_finding(rule_id="other-rule")]
         enriched = enrich_findings(findings, SAMPLE_YAML, api_key="fake-key")
 
         assert len(enriched) == 2
-        assert mock_client.messages.create.call_count == 2
+        assert enriched[0].explanation == "Explanation A"
+        assert enriched[1].explanation == "Explanation B"
+        assert mock_client.messages.create.call_count == 1
+
+    @patch("src.llm.claude_client.Anthropic")
+    def test_preserves_finding_order(self, mock_anthropic_cls):
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+        mock_client.messages.create.return_value = _mock_claude_response(
+            ("First explanation", "First fix"),
+            ("Second explanation", "Second fix"),
+            ("Third explanation", "Third fix"),
+        )
+
+        findings = [
+            _make_finding(rule_id="rule-1"),
+            _make_finding(rule_id="rule-2"),
+            _make_finding(rule_id="rule-3"),
+        ]
+        enriched = enrich_findings(findings, SAMPLE_YAML, api_key="fake-key")
+
+        assert enriched[0].finding.rule_id == "rule-1"
+        assert enriched[1].finding.rule_id == "rule-2"
+        assert enriched[2].finding.rule_id == "rule-3"
+        assert enriched[0].explanation == "First explanation"
+        assert enriched[2].explanation == "Third explanation"
+
+    def test_returns_empty_for_no_findings(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "fake-key")
+        result = enrich_findings([], SAMPLE_YAML, api_key="fake-key")
+        assert result == []
 
     @patch("src.llm.claude_client.Anthropic")
     def test_handles_invalid_json_response(self, mock_anthropic_cls):
@@ -120,6 +161,24 @@ class TestEnrichFindings:
 
         assert len(enriched) == 1
         assert enriched[0].explanation == "This is not JSON, just plain text."
+        assert enriched[0].suggested_fix == "Could not parse fix suggestion."
+
+    @patch("src.llm.claude_client.Anthropic")
+    def test_handles_wrong_array_length(self, mock_anthropic_cls):
+        mock_client = MagicMock()
+        mock_anthropic_cls.return_value = mock_client
+
+        response = MagicMock()
+        response.content = [TextBlock(
+            type="text",
+            text=json.dumps([{"explanation": "Only one", "suggested_fix": "Fix"}]),
+        )]
+        mock_client.messages.create.return_value = response
+
+        findings = [_make_finding(), _make_finding(rule_id="other-rule")]
+        enriched = enrich_findings(findings, SAMPLE_YAML, api_key="fake-key")
+
+        assert len(enriched) == 2
         assert enriched[0].suggested_fix == "Could not parse fix suggestion."
 
     def test_raises_without_api_key(self, monkeypatch):

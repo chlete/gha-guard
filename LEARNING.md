@@ -27,6 +27,7 @@ This document explains the **why** behind every design decision in gha-guard. It
    - [Exit Codes](#exit-codes)
    - [Structured Logging](#structured-logging)
    - [Type Checking with mypy](#type-checking-with-mypy)
+   - [LLM Batching — One Call for All Findings](#llm-batching--one-call-for-all-findings)
    - [Config File Auto-Discovery](#config-file-auto-discovery)
 7. [Testing Philosophy](#testing-philosophy)
 
@@ -766,6 +767,86 @@ python3 -m mypy src/
 ```
 
 It's also in CI (`python-app.yml`) so every PR is checked automatically.
+
+### LLM Batching — One Call for All Findings
+
+#### The problem with one call per finding
+
+The original implementation looped over findings and made a separate API call for each:
+
+```python
+for finding in findings:
+    response = client.messages.create(...)  # one call per finding
+```
+
+For a workflow with 7 findings, that's 7 API calls. Each call:
+- Sends the full workflow YAML again (repeated tokens = repeated cost)
+- Waits for a round-trip to the API (sequential latency adds up)
+- Has its own rate-limit budget consumed
+
+For large repos with many workflows and many findings, this is slow and expensive.
+
+#### The batched design
+
+All findings are sent in a single prompt. Claude returns a JSON **array** — one object per finding, in the same order:
+
+```python
+# Prompt structure (simplified):
+"""
+Here are 7 security finding(s):
+
+Finding 1:
+  Rule ID: unpinned-action
+  ...
+
+Finding 2:
+  Rule ID: write-all-permissions
+  ...
+
+Here is the full workflow YAML:
+...
+
+Respond with the JSON array only.
+"""
+```
+
+Claude responds with:
+```json
+[
+  {"explanation": "...", "suggested_fix": "..."},
+  {"explanation": "...", "suggested_fix": "..."},
+  ...
+]
+```
+
+One call. One response. The workflow YAML is sent once.
+
+#### Why a JSON array works reliably
+
+Claude is very good at following structured output instructions when the format is explicit. The system prompt says:
+
+> *"The array must have exactly as many objects as there are findings, in the same order."*
+
+This gives Claude a clear contract. The order guarantee is important — it's how we match each response back to its finding using `zip(findings, items)`.
+
+#### Handling the failure case
+
+What if Claude returns a malformed array, or the wrong number of items? We validate explicitly:
+
+```python
+if not isinstance(items, list) or len(items) != len(findings):
+    raise ValueError(...)
+```
+
+If validation fails, we fall back gracefully — every finding gets the raw response text as its explanation rather than crashing. This is a deliberate trade-off: **partial information is better than a hard failure**.
+
+#### `max_tokens` increase
+
+The original code used `max_tokens=1024` (enough for one finding's response). With batching, Claude needs to produce output for all findings. We increased this to `max_tokens=4096` to give it enough room.
+
+#### The trade-off
+
+Batching is almost always better, but there's one downside: if the response is malformed, **all findings** lose their enrichment rather than just one. The fallback mitigates this, but it's worth knowing. For very large numbers of findings (50+), chunking into groups would be the next step.
 
 ### Config File Auto-Discovery
 
