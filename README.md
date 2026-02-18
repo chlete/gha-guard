@@ -1,5 +1,7 @@
 # gha-guard
 
+[![Tests](https://github.com/chlete/gha-guard/actions/workflows/python-app.yml/badge.svg)](https://github.com/chlete/gha-guard/actions/workflows/python-app.yml)
+
 An AI-enhanced CLI tool that scans GitHub Actions workflow files for security vulnerabilities and provides actionable fix suggestions powered by Claude.
 
 ## What it detects
