@@ -13,6 +13,7 @@ An AI-enhanced CLI tool that scans GitHub Actions workflow files for security vu
 | `missing-permissions` | MEDIUM | Workflows without an explicit permissions block |
 | `script-injection` | CRITICAL | User-controlled values used directly in `run:` blocks |
 | `dangerous-trigger` | HIGH | Use of `pull_request_target` trigger |
+| `manual-trigger` | LOW | Workflow can be triggered manually via `workflow_dispatch` |
 | `secret-in-run` | HIGH | Secrets referenced directly in shell commands |
 
 ## Setup
@@ -42,6 +43,12 @@ python3 -m src scan path/to/.github/workflows/ --severity critical
 
 # Verbose logging
 python3 -m src -v scan path/to/.github/workflows/
+
+# Write full debug logs to a file
+python3 -m src --log-file scan.log scan path/to/.github/workflows/
+
+# Use an explicit config file
+python3 -m src scan path/to/.github/workflows/ --config path/to/.gha-guard.yml
 ```
 
 ### AI-enhanced scan (requires Anthropic API key)
@@ -51,7 +58,7 @@ export ANTHROPIC_API_KEY=your-key-here
 python3 -m src scan path/to/.github/workflows/ --enrich
 ```
 
-The `--enrich` flag sends each finding to Claude, which returns:
+The `--enrich` flag sends all findings to Claude in a single batched call, which returns:
 - A beginner-friendly explanation of the risk
 - A concrete YAML fix suggestion
 
