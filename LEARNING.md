@@ -659,23 +659,88 @@ def cli(verbose: bool) -> None: ...  # correct
 
 #### The real bug mypy found
 
-The most valuable fix wasn't a style issue — it was a **latent runtime bug** in the LLM client.
+The most valuable fix wasn't a style issue — it was a **latent runtime bug** in the LLM client. This is worth understanding in depth because it illustrates exactly why static analysis matters.
 
-Before:
+##### The original code
+
 ```python
-response_text = response.content[0].text.strip()  # unsafe!
+response_text = response.content[0].text.strip()
 ```
 
-Claude's API returns `response.content` as a list that can contain 10+ different block types: `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ServerToolUseBlock`, etc. Only `TextBlock` has a `.text` attribute. If Claude ever returned a thinking block or tool use block first, this line would crash with `AttributeError` at runtime.
+This looks completely reasonable. You call the API, you get a response, you grab the text. It worked in every test. It worked in every manual run. But it was a time bomb.
 
-mypy flagged all 10 union members that lack `.text`. The fix:
+##### Why it was wrong: Union types in the Anthropic SDK
+
+The Anthropic Python SDK types `response.content` as a list of a **Union type** — meaning each element can be one of many different classes:
 
 ```python
+# Simplified version of what the SDK actually declares:
+content: list[
+    TextBlock |
+    ThinkingBlock |
+    RedactedThinkingBlock |
+    ToolUseBlock |
+    ServerToolUseBlock |
+    WebSearchToolResultBlock |
+    WebFetchToolResultBlock |
+    CodeExecutionToolResultBlock |
+    BashCodeExecutionToolResultBlock |
+    TextEditorCodeExecutionToolResultBlock |
+    ToolSearchToolResultBlock |
+    ContainerUploadBlock
+]
+```
+
+That's 12 possible types. **Only `TextBlock` has a `.text` attribute.** All the others don't.
+
+So `response.content[0].text` is only safe if the first element happens to be a `TextBlock`. If Claude returns a `ThinkingBlock` first (which it does when you enable extended thinking), or a `ToolUseBlock` (if you configure tools), the line crashes:
+
+```
+AttributeError: 'ThinkingBlock' object has no attribute 'text'
+```
+
+##### Why tests didn't catch it
+
+Our tests always mocked the response with a single `TextBlock`. In production, Claude almost always returns a single `TextBlock` for simple prompts. So the bug was invisible — until it wasn't.
+
+This is the class of bug that only surfaces when:
+- You upgrade the `anthropic` package and Claude starts returning new block types
+- You change the model to one that uses extended thinking by default
+- Anthropic changes their API behaviour for certain prompts
+
+You'd get a crash in production with no warning, and it would be hard to reproduce locally.
+
+##### What mypy reported
+
+When we ran `mypy src/`, it flagged the line with 10 separate errors — one for each union member that lacks `.text`:
+
+```
+src/llm/claude_client.py:127: error: Item "ThinkingBlock" of "TextBlock | ThinkingBlock | ..." has no attribute "text"
+src/llm/claude_client.py:127: error: Item "ToolUseBlock" of "TextBlock | ThinkingBlock | ..." has no attribute "text"
+... (8 more)
+```
+
+mypy is saying: *"You're accessing `.text` on something that might not have it. I can prove, just by reading the type signatures, that this will crash in some cases."*
+
+##### The fix
+
+```python
+from anthropic.types import TextBlock
+
+# Filter to only the block types that have .text
 text_blocks = [b for b in response.content if isinstance(b, TextBlock)]
 response_text = text_blocks[0].text.strip() if text_blocks else ""
 ```
 
-This is the core value of static analysis: **it finds bugs in code paths you haven't exercised yet**.
+`isinstance(b, TextBlock)` narrows the type: after the filter, mypy knows every element in `text_blocks` is definitely a `TextBlock`, so `.text` is safe. The `if text_blocks else ""` handles the edge case where there are no text blocks at all.
+
+##### The broader lesson
+
+This bug pattern — **accessing an attribute on a union type without checking which variant you have** — is extremely common when working with external APIs. APIs evolve. New response types get added. Code written against the original API silently breaks.
+
+Static analysis catches it because it reasons about *all possible values*, not just the ones you happened to test. Your tests only cover the paths you thought of. mypy covers the paths the type system can prove exist.
+
+> **Rule of thumb:** whenever you call an external API and access attributes on the response, check what the SDK's type annotations actually say. If the return type is a Union, you must handle all variants.
 
 #### `__all__` and explicit exports
 
