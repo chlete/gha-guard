@@ -31,35 +31,43 @@ class EnrichedFinding:
 
 
 SYSTEM_PROMPT = """You are a GitHub Actions security expert. You will receive:
-1. A security finding (rule ID, severity, title, description, location)
+1. A list of security findings (each with an index, rule ID, severity, title, description, location)
 2. The original workflow YAML file
 
-For each finding, respond with EXACTLY this JSON format (no markdown, no extra text):
-{
-  "explanation": "A clear, beginner-friendly explanation of why this is a security risk. Use 2-3 sentences. Assume the reader knows basic GitHub Actions but not security.",
-  "suggested_fix": "A concrete YAML snippet showing how to fix this specific issue. Only show the relevant part that needs to change, not the whole file."
-}"""
+Respond with EXACTLY a JSON array — one object per finding, in the same order, no markdown, no extra text:
+[
+  {
+    "explanation": "A clear, beginner-friendly explanation of why this is a security risk. Use 2-3 sentences. Assume the reader knows basic GitHub Actions but not security.",
+    "suggested_fix": "A concrete YAML snippet showing how to fix this specific issue. Only show the relevant part that needs to change, not the whole file."
+  }
+]
+
+The array must have exactly as many objects as there are findings, in the same order."""
 
 
-def _build_user_prompt(finding: Finding, workflow_yaml: str) -> str:
-    """Build the prompt for a single finding."""
-    return f"""Here is the security finding:
+def _build_user_prompt(findings: list[Finding], workflow_yaml: str) -> str:
+    """Build a batched prompt for all findings in one request."""
+    findings_text = ""
+    for i, f in enumerate(findings, 1):
+        findings_text += f"""Finding {i}:
+  Rule ID: {f.rule_id}
+  Severity: {f.severity.value}
+  Title: {f.title}
+  Description: {f.description}
+  File: {f.file_path}
+  Job: {f.job_id or "(workflow-level)"}
+  Step: {f.step_name or "N/A"}
 
-Rule ID: {finding.rule_id}
-Severity: {finding.severity.value}
-Title: {finding.title}
-Description: {finding.description}
-File: {finding.file_path}
-Job: {finding.job_id or "(workflow-level)"}
-Step: {finding.step_name or "N/A"}
+"""
+    return f"""Here are {len(findings)} security finding(s):
 
-Here is the full workflow YAML:
+{findings_text}Here is the full workflow YAML:
 
 ```yaml
 {workflow_yaml}
 ```
 
-Respond with the JSON object only."""
+Respond with the JSON array only."""
 
 
 def enrich_findings(
@@ -69,7 +77,11 @@ def enrich_findings(
     model: str = "claude-sonnet-4-20250514",
 ) -> list[EnrichedFinding]:
     """
-    Enrich a list of findings using Claude.
+    Enrich a list of findings using Claude in a single batched API call.
+
+    All findings are sent together in one prompt, and Claude returns a JSON
+    array with one object per finding. This is significantly cheaper and faster
+    than one API call per finding.
 
     Args:
         findings: The deterministic findings from the rule engine.
@@ -87,66 +99,76 @@ def enrich_findings(
             "variable or pass api_key parameter."
         )
 
-    logger.info("Initializing Claude client (model=%s)", model)
+    if not findings:
+        return []
+
+    logger.info(
+        "Enriching %d finding(s) in a single batched call (model=%s)",
+        len(findings), model,
+    )
     client = Anthropic(api_key=key)
+    user_prompt = _build_user_prompt(findings, workflow_yaml)
+    logger.debug("Batched prompt length: %d chars", len(user_prompt))
+
+    t0 = time.monotonic()
+    try:
+        response = client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+    except Exception as e:
+        logger.error("Claude API request failed: %s", e)
+        raise
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    input_tokens = getattr(response.usage, "input_tokens", None)
+    output_tokens = getattr(response.usage, "output_tokens", None)
+    logger.info(
+        "Claude response: %.0fms, tokens in=%s out=%s",
+        elapsed_ms, input_tokens, output_tokens,
+    )
+
+    # Extract text — filter to TextBlock only (other block types lack .text)
+    text_blocks = [b for b in response.content if isinstance(b, TextBlock)]
+    response_text = text_blocks[0].text.strip() if text_blocks else ""
+    logger.debug("Raw response (%d chars): %.200s", len(response_text), response_text)
+
+    # Parse the JSON array response
+    try:
+        items = json.loads(response_text)
+        if not isinstance(items, list) or len(items) != len(findings):
+            raise ValueError(
+                f"Expected a JSON array of {len(findings)} item(s), "
+                f"got: {type(items).__name__} with "
+                f"{len(items) if isinstance(items, list) else '?'} item(s)"
+            )
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.warning(
+            "Failed to parse batched Claude response: %s. "
+            "Response starts with: %.200s",
+            e, response_text,
+        )
+        # Fallback: return raw text as explanation for all findings
+        return [
+            EnrichedFinding(
+                finding=f,
+                explanation=response_text,
+                suggested_fix="Could not parse fix suggestion.",
+            )
+            for f in findings
+        ]
+
     enriched = []
-
-    for i, finding in enumerate(findings, 1):
-        logger.info(
-            "Enriching finding %d/%d: [%s] %s",
-            i, len(findings), finding.rule_id, finding.title,
-        )
-        user_prompt = _build_user_prompt(finding, workflow_yaml)
-        logger.debug("Prompt length: %d chars", len(user_prompt))
-
-        t0 = time.monotonic()
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=1024,
-                system=SYSTEM_PROMPT,
-                messages=[
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-        except Exception as e:
-            logger.error(
-                "Claude API request failed for finding '%s': %s",
-                finding.rule_id, e,
-            )
-            raise
-
-        elapsed_ms = (time.monotonic() - t0) * 1000
-        input_tokens = getattr(response.usage, "input_tokens", None)
-        output_tokens = getattr(response.usage, "output_tokens", None)
-        logger.info(
-            "Claude response for '%s': %.0fms, tokens in=%s out=%s",
-            finding.rule_id, elapsed_ms, input_tokens, output_tokens,
-        )
-
-        # Parse the JSON response — filter to TextBlock only (other block types lack .text)
-        text_blocks = [b for b in response.content if isinstance(b, TextBlock)]
-        response_text = text_blocks[0].text.strip() if text_blocks else ""
-        logger.debug("Raw response (%d chars): %.200s", len(response_text), response_text)
-        try:
-            data = json.loads(response_text)
-            explanation = data.get("explanation", "No explanation provided.")
-            suggested_fix = data.get("suggested_fix", "No fix suggested.")
-        except json.JSONDecodeError:
-            logger.warning(
-                "Failed to parse Claude response as JSON for finding '%s'. "
-                "Response starts with: %.100s",
-                finding.rule_id, response_text,
-            )
-            # If Claude doesn't return valid JSON, use the raw text
-            explanation = response_text
-            suggested_fix = "Could not parse fix suggestion."
-
+    for finding, item in zip(findings, items):
         enriched.append(EnrichedFinding(
             finding=finding,
-            explanation=explanation,
-            suggested_fix=suggested_fix,
+            explanation=item.get("explanation", "No explanation provided."),
+            suggested_fix=item.get("suggested_fix", "No fix suggested."),
         ))
 
-    logger.info("Enrichment complete: %d finding(s) processed", len(enriched))
+    logger.info("Enrichment complete: %d finding(s) processed in 1 API call", len(enriched))
     return enriched

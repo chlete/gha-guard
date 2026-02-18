@@ -296,7 +296,35 @@ respond with EXACTLY this JSON format..."""
 
 We ask for **JSON only** — no markdown, no extra text. This makes parsing reliable. If Claude returns invalid JSON (rare), we fall back to using the raw text.
 
-Each finding gets its own API call. This keeps prompts focused and responses precise. Claude sees the specific finding + the full YAML for context.
+**Batching all findings into one call:**
+
+The original design made one API call per finding. For a workflow with 7 findings that meant 7 round-trips, and the full workflow YAML was sent 7 times (repeated tokens = repeated cost).
+
+The current design sends all findings together in a single prompt and asks Claude to return a JSON **array** — one object per finding, in the same order:
+
+```
+Here are 7 security finding(s):
+
+Finding 1: unpinned-action ...
+Finding 2: write-all-permissions ...
+...
+
+Here is the full workflow YAML: ...
+
+Respond with the JSON array only.
+```
+
+Claude returns:
+```json
+[
+  {"explanation": "...", "suggested_fix": "..."},
+  {"explanation": "...", "suggested_fix": "..."}
+]
+```
+
+We then use `zip(findings, items)` to pair each response back to its finding. The order contract is enforced by the system prompt: *"The array must have exactly as many objects as there are findings, in the same order."*
+
+If Claude returns the wrong number of items or malformed JSON, we validate and fall back gracefully — every finding gets the raw response text rather than crashing. **Partial information is better than a hard failure.**
 
 ---
 
