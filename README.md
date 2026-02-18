@@ -1,4 +1,4 @@
-# GitHub Actions Security Scanner
+# gha-guard
 
 An AI-enhanced CLI tool that scans GitHub Actions workflow files for security vulnerabilities and provides actionable fix suggestions powered by Claude.
 
